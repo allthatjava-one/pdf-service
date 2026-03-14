@@ -1,0 +1,20 @@
+# Local development secrets — never commit this file
+.dev.vars
+
+# Wrangler output
+.wrangler/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# OS artefacts
+.DS_Store
+Thumbs.db

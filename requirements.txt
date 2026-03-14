@@ -1,0 +1,3 @@
+# Local development only (IDE type-checking, linting).
+# The Cloudflare Workers runtime uses cf-requirements.txt instead.
+# No third-party packages are required — compression uses stdlib (zlib) only.

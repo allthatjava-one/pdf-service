@@ -1,0 +1,6 @@
+* text=auto
+
+# Force LF for files that Wrangler/Cloudflare tooling reads directly
+cf-requirements.txt text eol=lf
+wrangler.toml text eol=lf
+src/*.py text eol=lf
