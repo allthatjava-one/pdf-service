@@ -44,7 +44,7 @@ from presigned_url import generate_presigned_url
 
 _ALLOWED_METHODS = "POST, OPTIONS"
 _ALLOWED_HEADERS = "Content-Type, Authorization"
-_DEFAULT_EXPIRY  = 3600  # seconds
+_DEFAULT_EXPIRY  = 60  # minutes
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +211,7 @@ async def _handle_compress(request, env, cors_headers: dict[str, str]) -> Respon
 
     # --- Generate presigned download URL ---
     try:
-        expiry      = int(getattr(env, "PRESIGNED_URL_EXPIRY", _DEFAULT_EXPIRY))
+        expiry      = int(getattr(env, "PRESIGNED_URL_EXPIRY", _DEFAULT_EXPIRY)) * 60
         presigned   = generate_presigned_url(
             account_id        = env.R2_ACCOUNT_ID,
             access_key_id     = env.R2_ACCESS_KEY_ID,
@@ -229,7 +229,7 @@ async def _handle_compress(request, env, cors_headers: dict[str, str]) -> Respon
             extra_headers=cors_headers,
         )
 
-    print(f"[INFO] Presigned URL generated (expires in {expiry}s)")
+    print(f"[INFO] Presigned URL generated (expires in {expiry // 60} min)")
 
     return _json_response(
         {
