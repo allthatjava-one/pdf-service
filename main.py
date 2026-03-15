@@ -1,0 +1,258 @@
+"""
+FastAPI entry point for the PDF Compressor Service (Koyeb deployment).
+
+Routes
+------
+  GET  /hello                  — Health check
+  POST /compress               — Retrieve PDF from R2, compress, store back,
+                                 return a presigned download URL
+  POST /admin/trigger-cleanup  — Manually invoke the R2 cleanup (requires Bearer token)
+
+Scheduled task
+--------------
+  Runs delete_old_compressed_files() on the interval defined by CLEANUP_MINUTES
+  using APScheduler (started in the FastAPI lifespan).
+
+Environment variables
+---------------------
+  R2_ACCOUNT_ID         — Cloudflare account ID
+  R2_BUCKET_NAME        — R2 bucket name
+  R2_ACCESS_KEY_ID      — R2 S3-compatible access key ID
+  R2_SECRET_ACCESS_KEY  — R2 S3-compatible secret key
+  ALLOWED_ORIGINS       — Comma-separated CORS origins, or "*"
+  PRESIGNED_URL_EXPIRY  — Presigned URL lifetime in minutes (default: 60)
+  CLEANUP_MINUTES       — Age threshold in minutes for cleanup (default: 60)
+  ADMIN_SECRET          — Bearer token for /admin/* endpoints
+  PORT                  — TCP port to listen on (injected by Koyeb, default: 8000)
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import traceback
+from contextlib import asynccontextmanager
+
+import boto3
+from dotenv import load_dotenv
+
+load_dotenv()
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from src.cleanup import delete_old_compressed_files
+from src.pdf_compressor import compress_pdf
+from src.presigned_url import generate_presigned_url
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
+
+
+_REQUIRED_ENVS = [
+    "R2_ACCOUNT_ID",
+    "R2_BUCKET_NAME",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+]
+
+
+def _check_required_envs() -> None:
+    missing = [k for k in _REQUIRED_ENVS if not os.environ.get(k)]
+    if missing:
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing)}. "
+            "Copy .env.example to .env and fill in the values."
+        )
+
+
+def _r2_client():
+    _check_required_envs()
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{_env('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com",
+        aws_access_key_id=_env("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+        region_name="auto",
+    )
+
+
+def _build_compressed_key(original_key: str) -> str:
+    if "." in original_key.split("/")[-1]:
+        name, _, ext = original_key.rpartition(".")
+        return f"{name}-compressed.{ext}"
+    return f"{original_key}-compressed"
+
+
+# ---------------------------------------------------------------------------
+# Scheduler — runs cleanup periodically
+# ---------------------------------------------------------------------------
+
+scheduler = AsyncIOScheduler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_minutes = int(_env("CLEANUP_MINUTES", "60"))
+    scheduler.add_job(
+        _scheduled_cleanup,
+        "interval",
+        minutes=cleanup_minutes,
+        id="r2_cleanup",
+    )
+    scheduler.start()
+    log.info("Scheduler started (cleanup every %d min)", cleanup_minutes)
+    yield
+    scheduler.shutdown()
+
+
+async def _scheduled_cleanup():
+    log.info("[CRON] Scheduled cleanup triggered")
+    try:
+        result = await delete_old_compressed_files(
+            bucket_name=_env("R2_BUCKET_NAME"),
+            s3_client=_r2_client(),
+            cleanup_minutes=int(_env("CLEANUP_MINUTES", "60")),
+        )
+        log.info(
+            "[CRON] Cleanup done: %d deleted, %d skipped, %d errors",
+            len(result["deleted"]), result["skipped"], len(result["errors"]),
+        )
+    except Exception:
+        log.error("[CRON] Cleanup failed:\n%s", traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# App & CORS
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="pdf-compressor-service", lifespan=lifespan)
+
+_origins_cfg = _env("ALLOWED_ORIGINS", "*")
+_origins = [o.strip() for o in _origins_cfg.split(",") if o.strip()] if _origins_cfg != "*" else ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=86400,
+)
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/hello")
+def hello():
+    return {"status": "ok", "message": "pdf-compressor-service is running"}
+
+
+@app.post("/compress")
+async def compress(request: Request):
+    body = await request.json()
+    object_key: str | None = body.get("objectKey") if isinstance(body, dict) else None
+    if not object_key or not isinstance(object_key, str) or not object_key.strip():
+        raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
+
+    object_key = object_key.strip()
+    log.info("[INFO] /compress request for key: %r", object_key)
+
+    s3 = _r2_client()
+    bucket = _env("R2_BUCKET_NAME")
+
+    # --- Fetch original file from R2 ---
+    try:
+        response = s3.get_object(Bucket=bucket, Key=object_key)
+        original_bytes = response["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+    except Exception as exc:
+        log.error("[ERROR] R2 fetch failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+
+    original_size = len(original_bytes)
+    log.info("[INFO] Original size: %d bytes", original_size)
+
+    # --- Compress ---
+    try:
+        compressed_bytes = compress_pdf(original_bytes)
+    except Exception as exc:
+        log.error("[ERROR] Compression failed: %s", exc)
+        raise HTTPException(status_code=422, detail=f"PDF compression failed: {exc}")
+
+    compressed_size = len(compressed_bytes)
+    log.info(
+        "[INFO] Compressed size: %d bytes (ratio: %.1f%%)",
+        compressed_size, compressed_size / original_size * 100,
+    )
+
+    # --- Store compressed file back to R2 ---
+    compressed_key = _build_compressed_key(object_key)
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=compressed_key,
+            Body=io.BytesIO(compressed_bytes),
+            ContentType="application/pdf",
+        )
+    except Exception as exc:
+        log.error("[ERROR] R2 put failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store compressed file in R2")
+
+    log.info("[INFO] Stored compressed file as: %r", compressed_key)
+
+    # --- Generate presigned URL ---
+    try:
+        expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+        presigned = generate_presigned_url(
+            account_id=_env("R2_ACCOUNT_ID"),
+            access_key_id=_env("R2_ACCESS_KEY_ID"),
+            secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+            bucket_name=bucket,
+            object_key=compressed_key,
+            expires_in=expiry_minutes * 60,
+        )
+    except Exception as exc:
+        log.error("[ERROR] Presigned URL generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+
+    log.info("[INFO] Presigned URL generated (expires in %d min)", expiry_minutes)
+
+    return {
+        "success": True,
+        "compressedKey": compressed_key,
+        "presignedUrl": presigned,
+        "originalSize": original_size,
+        "compressedSize": compressed_size,
+    }
+
+
+@app.post("/admin/trigger-cleanup")
+async def trigger_cleanup(authorization: str = Header(default="")):
+    admin_secret = _env("ADMIN_SECRET")
+    if not admin_secret:
+        raise HTTPException(status_code=500, detail="ADMIN_SECRET is not configured")
+    if authorization != f"Bearer {admin_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    log.info("[INFO] Manual cleanup triggered via /admin/trigger-cleanup")
+    try:
+        result = await delete_old_compressed_files(
+            bucket_name=_env("R2_BUCKET_NAME"),
+            s3_client=_r2_client(),
+            cleanup_minutes=int(_env("CLEANUP_MINUTES", "60")),
+        )
+        return {"success": True, "result": result}
+    except Exception as exc:
+        log.error("[ERROR] Cleanup failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}")
