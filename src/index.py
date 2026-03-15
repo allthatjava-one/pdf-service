@@ -30,8 +30,9 @@ from __future__ import annotations
 import json
 import traceback
 
-from js import Headers, Response, URL as JSURL
+from js import Response
 from pyodide.ffi import to_js
+from urllib.parse import urlparse
 
 from cleanup import delete_old_compressed_files
 from pdf_compressor import compress_pdf
@@ -66,14 +67,6 @@ def _build_cors_headers(request_origin: str, allowed_origins_cfg: str) -> dict[s
         "Access-Control-Allow-Headers": _ALLOWED_HEADERS,
         "Access-Control-Max-Age":       "86400",
     }
-
-
-def _make_headers(base: dict[str, str]) -> Headers:
-    """Convert a Python dict to a JS Headers object."""
-    h = Headers.new()
-    for key, value in base.items():
-        h.set(key, str(value))
-    return h
 
 
 def _json_response(
@@ -290,8 +283,8 @@ async def on_fetch(request, env, ctx):  # noqa: ARG001 (ctx unused but required 
 
     # --- Route ---
     try:
-        url_obj = JSURL.new(request.url)
-        path    = url_obj.pathname.rstrip("/") or "/"
+        url_obj = urlparse(str(request.url))
+        path    = url_obj.path.rstrip("/") or "/"
 
         print("[INFO] Incoming request:", request.method, path)
 
