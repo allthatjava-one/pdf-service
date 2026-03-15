@@ -23,19 +23,6 @@ bucket_name = "pdf-compressor"
 # Do NOT hardcode this value here.
 # R2_ACCOUNT_ID = ""
 
-# R2 bucket name (must match the bucket_name above)
-R2_BUCKET_NAME = "pdf-compressor"
-
-# Comma-separated list of allowed origins for CORS, or "*" for all
-ALLOWED_ORIGINS = "https://your-frontend.com"
-
-# Lifetime of the generated presigned URL in seconds (default 1 hour)
-PRESIGNED_URL_EXPIRY = "3600"
-
-# Minimum age (in minutes) a "-compressed" file must reach before the
-# scheduled cleanup will delete it.  Tune this to match your cron frequency.
-CLEANUP_MINUTES = "60"
-
 # ---------------------------------------------------------------------------
 # Cron Triggers — scheduled cleanup of old compressed files.
 # Adjust the cron expression to match your desired cleanup frequency.
