@@ -43,4 +43,4 @@ CLEANUP_MINUTES = "60"
 # Reference: https://developers.cloudflare.com/workers/configuration/cron-triggers/
 # ---------------------------------------------------------------------------
 [triggers]
-crons = ["*/1 * * * *"]   # every hour — change to e.g. "*/30 * * * *" for every 30 min
+crons = ["*/5 * * * *"]   # every hour — change to e.g. "*/30 * * * *" for every 30 min
