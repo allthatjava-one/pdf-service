@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import traceback
-from urllib import request
 
 from js import Headers, Response, URL as JSURL
 from pyodide.ffi import to_js
