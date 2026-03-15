@@ -13,7 +13,9 @@ Keep all variables as secret type
 
 # Install on Koyeb
 ```
-> pip install -r requirements.txt
+> build command: leave empty
+> run command: uvicorn main:app --host 0.0.0.0 --port $PORT
+> Work directory: leave empty
 ```
 # Run
 ```
