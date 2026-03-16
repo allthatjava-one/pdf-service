@@ -13,12 +13,11 @@ Keep all variables as secret type
 
 # Install on Koyeb
 ```
-> builder: Buildpacks
 > build command: leave empty
-> run command: leave empty (use Procfile)
+> run command: uvicorn main:app --host 0.0.0.0 --port $PORT
 > Work directory: leave empty
 ```
 # Run
 ```
-python -m uvicorn main:app --host 0.0.0.0 --port 8787
+uvicorn main:app --host 0.0.0.0 --port 8787
 ```

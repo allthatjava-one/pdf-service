@@ -6,6 +6,8 @@ Routes
   GET  /hello                  — Health check
   POST /compress               — Retrieve PDF from R2, compress, store back,
                                  return a presigned download URL
+    POST /merge                  — Retrieve PDFs from R2, merge them, store back,
+                                                                 return a presigned download URL
   POST /admin/trigger-cleanup  — Manually invoke the R2 cleanup (requires Bearer token)
 
 Scheduled task
@@ -45,6 +47,7 @@ from fastapi.responses import JSONResponse
 
 from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
+from src.pdf_merge import merge_pdfs
 from src.presigned_url import generate_presigned_url
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -91,6 +94,13 @@ def _build_compressed_key(original_key: str) -> str:
         name, _, ext = original_key.rpartition(".")
         return f"{name}-compressed.{ext}"
     return f"{original_key}-compressed"
+
+
+def _build_merged_key(original_key: str) -> str:
+    if "." in original_key.split("/")[-1]:
+        name, _, ext = original_key.rpartition(".")
+        return f"{name}-merged.{ext}"
+    return f"{original_key}-merged"
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +244,86 @@ async def compress(request: Request):
         "presignedUrl": presigned,
         "originalSize": original_size,
         "compressedSize": compressed_size,
+    }
+
+
+@app.post("/merge")
+async def merge(request: Request):
+    body = await request.json()
+    object_keys = body.get("objectKeys") if isinstance(body, dict) else None
+    if not isinstance(object_keys, list) or len(object_keys) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing or invalid field: 'objectKeys' (must contain at least 2 items)",
+        )
+
+    normalized_keys = []
+    for object_key in object_keys:
+        if not isinstance(object_key, str) or not object_key.strip():
+            raise HTTPException(status_code=400, detail="All 'objectKeys' entries must be non-empty strings")
+        normalized_keys.append(object_key.strip())
+
+    log.info("[INFO] /merge request for keys: %r", normalized_keys)
+
+    s3 = _r2_client()
+    bucket = _env("R2_BUCKET_NAME")
+    source_pdfs: list[bytes] = []
+    original_total_size = 0
+
+    for object_key in normalized_keys:
+        try:
+            response = s3.get_object(Bucket=bucket, Key=object_key)
+            pdf_bytes = response["Body"].read()
+        except s3.exceptions.NoSuchKey:
+            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+        except Exception as exc:
+            log.error("[ERROR] R2 fetch failed for %r: %s", object_key, exc)
+            raise HTTPException(status_code=500, detail="Failed to fetch objects from R2")
+
+        source_pdfs.append(pdf_bytes)
+        original_total_size += len(pdf_bytes)
+
+    try:
+        merged_bytes = merge_pdfs(source_pdfs)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"PDF merge failed: {exc}")
+    except Exception as exc:
+        log.error("[ERROR] Merge failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to merge PDF files")
+
+    merged_key = _build_merged_key(normalized_keys[0])
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=merged_key,
+            Body=io.BytesIO(merged_bytes),
+            ContentType="application/pdf",
+        )
+    except Exception as exc:
+        log.error("[ERROR] R2 put failed for merged file: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store merged file in R2")
+
+    try:
+        expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+        presigned = generate_presigned_url(
+            account_id=_env("R2_ACCOUNT_ID"),
+            access_key_id=_env("R2_ACCESS_KEY_ID"),
+            secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+            bucket_name=bucket,
+            object_key=merged_key,
+            expires_in=expiry_minutes * 60,
+        )
+    except Exception as exc:
+        log.error("[ERROR] Presigned URL generation failed for merged file: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+
+    return {
+        "success": True,
+        "mergedKey": merged_key,
+        "presignedUrl": presigned,
+        "sourceCount": len(normalized_keys),
+        "originalTotalSize": original_total_size,
+        "mergedSize": len(merged_bytes),
     }
 
 

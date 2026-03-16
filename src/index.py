@@ -5,6 +5,8 @@ Routing
 -------
   POST /compress   — Retrieve a PDF from R2, compress it, store it back, and
                      return a presigned download URL.
+    POST /merge      — Retrieve multiple PDFs from R2, merge them, store the
+                                         merged file, and return a presigned download URL.
 
 Cron trigger
 ------------
@@ -36,6 +38,7 @@ from urllib.parse import urlparse
 
 from cleanup import delete_old_compressed_files
 from pdf_compressor import compress_pdf
+from pdf_merge import merge_pdfs
 from presigned_url import generate_presigned_url
 
 # ---------------------------------------------------------------------------
@@ -244,6 +247,118 @@ async def _handle_compress(request, env, cors_headers: dict[str, str]) -> Respon
     )
 
 
+async def _handle_merge(request, env, cors_headers: dict[str, str]) -> Response:
+    """Handle POST /merge."""
+
+    try:
+        raw_body = await request.text()
+        body = json.loads(raw_body)
+    except Exception:
+        return _json_response(
+            {"error": "Invalid JSON body"},
+            status=400,
+            extra_headers=cors_headers,
+        )
+
+    object_keys = body.get("objectKeys") if isinstance(body, dict) else None
+    if not isinstance(object_keys, list) or len(object_keys) < 2:
+        return _json_response(
+            {"error": "Missing or invalid field: 'objectKeys' (must contain at least 2 items)"},
+            status=400,
+            extra_headers=cors_headers,
+        )
+
+    normalized_keys = []
+    for object_key in object_keys:
+        if not isinstance(object_key, str) or not object_key.strip():
+            return _json_response(
+                {"error": "All 'objectKeys' entries must be non-empty strings"},
+                status=400,
+                extra_headers=cors_headers,
+            )
+        normalized_keys.append(object_key.strip())
+
+    print(f"[INFO] /merge request for keys: {normalized_keys!r}")
+
+    source_pdfs: list[bytes] = []
+    original_total_size = 0
+
+    for object_key in normalized_keys:
+        r2_object = await env.R2_BUCKET.get(object_key)
+        if r2_object is None:
+            print(f"[WARN] Object not found in R2: {object_key!r}")
+            return _json_response(
+                {"error": f"Object not found: {object_key}"},
+                status=404,
+                extra_headers=cors_headers,
+            )
+
+        try:
+            array_buffer = await r2_object.arrayBuffer()
+            pdf_bytes = bytes(array_buffer.to_py())
+        except AttributeError:
+            from js import Uint8Array  # noqa: PLC0415
+            pdf_bytes = bytes(Uint8Array.new(await r2_object.arrayBuffer()))
+
+        source_pdfs.append(pdf_bytes)
+        original_total_size += len(pdf_bytes)
+
+    try:
+        merged_bytes = merge_pdfs(source_pdfs)
+    except ValueError as exc:
+        return _json_response(
+            {"error": f"PDF merge failed: {exc}"},
+            status=422,
+            extra_headers=cors_headers,
+        )
+    except Exception as exc:
+        print(f"[ERROR] Merge failed: {exc}")
+        traceback.print_exc()
+        return _json_response(
+            {"error": "Failed to merge PDF files"},
+            status=500,
+            extra_headers=cors_headers,
+        )
+
+    merged_key = _build_merged_key(normalized_keys[0])
+    put_options = to_js({
+        "httpMetadata": {"contentType": "application/pdf"},
+    })
+    await env.R2_BUCKET.put(merged_key, to_js(merged_bytes), put_options)
+
+    try:
+        expiry = int(getattr(env, "PRESIGNED_URL_EXPIRY", _DEFAULT_EXPIRY)) * 60
+        presigned = generate_presigned_url(
+            account_id=env.R2_ACCOUNT_ID,
+            access_key_id=env.R2_ACCESS_KEY_ID,
+            secret_access_key=env.R2_SECRET_ACCESS_KEY,
+            bucket_name=env.R2_BUCKET_NAME,
+            object_key=merged_key,
+            expires_in=expiry,
+        )
+    except Exception as exc:
+        print(f"[ERROR] Presigned URL generation failed: {exc}")
+        traceback.print_exc()
+        return _json_response(
+            {"error": "Failed to generate presigned URL"},
+            status=500,
+            extra_headers=cors_headers,
+        )
+
+    return _json_response(
+        {
+            "success": True,
+            "mergedKey": merged_key,
+            "presignedUrl": presigned,
+            "sourceCount": len(normalized_keys),
+            "originalTotalSize": original_total_size,
+            "mergedSize": len(merged_bytes),
+        },
+        status=200,
+        extra_headers=cors_headers,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Key-name helper
 # ---------------------------------------------------------------------------
@@ -262,6 +377,15 @@ def _build_compressed_key(original_key: str) -> str:
         name, _, ext = original_key.rpartition(".")
         return f"{name}-compressed.{ext}"
     return f"{original_key}-compressed"
+
+
+def _build_merged_key(original_key: str) -> str:
+    """Return the merged variant of *original_key*."""
+    filename = original_key.split("/")[-1]
+    if "." in filename:
+        name, _, ext = original_key.rpartition(".")
+        return f"{name}-merged.{ext}"
+    return f"{original_key}-merged"
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +420,9 @@ async def on_fetch(request, env, ctx):  # noqa: ARG001 (ctx unused but required 
 
         if path == "/compress" and request.method == "POST":
             return await _handle_compress(request, env, cors_headers)
+
+        if path == "/merge" and request.method == "POST":
+            return await _handle_merge(request, env, cors_headers)
 
         return _json_response(
             {"error": "Not found"},
