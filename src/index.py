@@ -89,7 +89,7 @@ def _json_response(
 def _handle_hello() -> Response:
     """GET /hello — health-check endpoint, open to all origins."""
     return _json_response(
-        {"status": "ok", "message": "pdf-compressor-service is running"},
+        {"status": "ok", "message": "pdf-service is running"},
         status=200,
         extra_headers={"Access-Control-Allow-Origin": "*"},
     )

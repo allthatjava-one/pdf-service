@@ -135,7 +135,7 @@ async def _scheduled_cleanup():
 # App & CORS
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="pdf-compressor-service", lifespan=lifespan)
+app = FastAPI(title="pdf-service", lifespan=lifespan)
 
 _origins_cfg = _env("ALLOWED_ORIGINS", "*")
 _origins = [o.strip() for o in _origins_cfg.split(",") if o.strip()] if _origins_cfg != "*" else ["*"]
@@ -154,7 +154,7 @@ app.add_middleware(
 
 @app.get("/hello")
 def hello():
-    return {"status": "ok", "message": "pdf-compressor-service is running"}
+    return {"status": "ok", "message": "pdf-service is running"}
 
 
 @app.post("/compress")
