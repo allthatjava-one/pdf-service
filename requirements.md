@@ -14,6 +14,7 @@ This is a backend service that provides an API that serves the api-gateway's cal
 
 ## API Endpoints
 - `POST /compress`: Accepts Object Key then retrieved the stored file from R2 Stroage, compresses it and then stores the compressed file back to R2 Storage. Finally, it returns the pre-signedURL from R2 Storage of the compressed file.
+= `POST /merge`: Accepts multiple objectKeys, retrieves the stored files from R2 Storage, merges them into a single file, stores the merged file back to R2 Storage, and returns the pre-signedURL from R2 Storage of the merged file.
 
 # Notes
 - The compressed file name should be orignal file name with a suffix "-compressed" before the file extension. For example, if the original file is "image.jpg", the compressed file should be named "image-compressed.jpg".
@@ -21,3 +22,5 @@ This is a backend service that provides an API that serves the api-gateway's cal
 - All necessary environment variables and configurations should be properly set up for the service to function correctly. Such as R2 Storage credentials, Cloudflare Workers configurations, and Allowed origins for CORS.
 - The service should be designed to be scalable and efficient, ensuring that it can handle a high volume of requests without performance degradation.
 - Proper logging and monitoring should be implemented to track the performance and identify any issues that may arise during the operation of the service.
+- The merged file name should be first file name with a suffix "-merged" before the file extension. For example, if the original files are "file1.txt" and "file2.txt", the merged file should be named "file1-merged.txt".
+
