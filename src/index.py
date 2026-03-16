@@ -29,10 +29,10 @@ from __future__ import annotations
 
 import json
 import traceback
-from urllib import request
 
-from js import Headers, Response, URL as JSURL
+from js import Response
 from pyodide.ffi import to_js
+from urllib.parse import urlparse
 
 from cleanup import delete_old_compressed_files
 from pdf_compressor import compress_pdf
@@ -44,7 +44,7 @@ from presigned_url import generate_presigned_url
 
 _ALLOWED_METHODS = "POST, OPTIONS"
 _ALLOWED_HEADERS = "Content-Type, Authorization"
-_DEFAULT_EXPIRY  = 3600  # seconds
+_DEFAULT_EXPIRY  = 60  # minutes
 
 
 # ---------------------------------------------------------------------------
@@ -69,14 +69,6 @@ def _build_cors_headers(request_origin: str, allowed_origins_cfg: str) -> dict[s
     }
 
 
-def _make_headers(base: dict[str, str]) -> Headers:
-    """Convert a Python dict to a JS Headers object."""
-    h = Headers.new()
-    for key, value in base.items():
-        h.set(key, str(value))
-    return h
-
-
 def _json_response(
     data: dict,
     *,
@@ -97,7 +89,7 @@ def _json_response(
 def _handle_hello() -> Response:
     """GET /hello — health-check endpoint, open to all origins."""
     return _json_response(
-        {"status": "ok", "message": "pdf-compressor-service is running"},
+        {"status": "ok", "message": "pdf-service is running"},
         status=200,
         extra_headers={"Access-Control-Allow-Origin": "*"},
     )
@@ -219,7 +211,7 @@ async def _handle_compress(request, env, cors_headers: dict[str, str]) -> Respon
 
     # --- Generate presigned download URL ---
     try:
-        expiry      = int(getattr(env, "PRESIGNED_URL_EXPIRY", _DEFAULT_EXPIRY))
+        expiry      = int(getattr(env, "PRESIGNED_URL_EXPIRY", _DEFAULT_EXPIRY)) * 60
         presigned   = generate_presigned_url(
             account_id        = env.R2_ACCOUNT_ID,
             access_key_id     = env.R2_ACCESS_KEY_ID,
@@ -237,7 +229,7 @@ async def _handle_compress(request, env, cors_headers: dict[str, str]) -> Respon
             extra_headers=cors_headers,
         )
 
-    print(f"[INFO] Presigned URL generated (expires in {expiry}s)")
+    print(f"[INFO] Presigned URL generated (expires in {expiry // 60} min)")
 
     return _json_response(
         {
@@ -291,8 +283,8 @@ async def on_fetch(request, env, ctx):  # noqa: ARG001 (ctx unused but required 
 
     # --- Route ---
     try:
-        url_obj = JSURL.new(request.url)
-        path    = url_obj.pathname.rstrip("/") or "/"
+        url_obj = urlparse(str(request.url))
+        path    = url_obj.path.rstrip("/") or "/"
 
         print("[INFO] Incoming request:", request.method, path)
 
