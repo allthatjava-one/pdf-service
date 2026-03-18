@@ -19,5 +19,5 @@ Keep all variables as secret type
 ```
 # Run
 ```
-uvicorn main:app --host 0.0.0.0 --port 8787
+python -m uvicorn main:app --host 0.0.0.0 --port 8787
 ```

@@ -251,6 +251,7 @@ async def compress(request: Request):
 async def merge(request: Request):
     body = await request.json()
     object_keys = body.get("objectKeys") if isinstance(body, dict) else None
+    compress = body.get("compress") if isinstance(body, dict) else False
     if not isinstance(object_keys, list) or len(object_keys) < 2:
         raise HTTPException(
             status_code=400,
@@ -263,7 +264,7 @@ async def merge(request: Request):
             raise HTTPException(status_code=400, detail="All 'objectKeys' entries must be non-empty strings")
         normalized_keys.append(object_key.strip())
 
-    log.info("[INFO] /merge request for keys: %r", normalized_keys)
+    log.info("[INFO] /merge request for keys: %r, compress=%r", normalized_keys, compress)
 
     s3 = _r2_client()
     bucket = _env("R2_BUCKET_NAME")
@@ -292,16 +293,33 @@ async def merge(request: Request):
         raise HTTPException(status_code=500, detail="Failed to merge PDF files")
 
     merged_key = _build_merged_key(normalized_keys[0])
+    result_key = merged_key
+    result_bytes = merged_bytes
+    merged_size = len(merged_bytes)
+    compressed_size = None
+
+    if compress:
+        try:
+            compressed_bytes = compress_pdf(merged_bytes)
+            compressed_key = _build_compressed_key(merged_key)
+            result_key = compressed_key
+            result_bytes = compressed_bytes
+            compressed_size = len(compressed_bytes)
+            log.info("[INFO] Compressed merged PDF: %d -> %d bytes", merged_size, compressed_size)
+        except Exception as exc:
+            log.error("[ERROR] Compression after merge failed: %s", exc)
+            raise HTTPException(status_code=422, detail=f"Compression after merge failed: {exc}")
+
     try:
         s3.put_object(
             Bucket=bucket,
-            Key=merged_key,
-            Body=io.BytesIO(merged_bytes),
+            Key=result_key,
+            Body=io.BytesIO(result_bytes),
             ContentType="application/pdf",
         )
     except Exception as exc:
-        log.error("[ERROR] R2 put failed for merged file: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to store merged file in R2")
+        log.error("[ERROR] R2 put failed for merged/compressed file: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store merged/compressed file in R2")
 
     try:
         expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
@@ -310,21 +328,27 @@ async def merge(request: Request):
             access_key_id=_env("R2_ACCESS_KEY_ID"),
             secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
             bucket_name=bucket,
-            object_key=merged_key,
+            object_key=result_key,
             expires_in=expiry_minutes * 60,
         )
     except Exception as exc:
-        log.error("[ERROR] Presigned URL generation failed for merged file: %s", exc)
+        log.error("[ERROR] Presigned URL generation failed for merged/compressed file: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
 
-    return {
+    response_data = {
         "success": True,
         "mergedKey": merged_key,
         "presignedUrl": presigned,
         "sourceCount": len(normalized_keys),
         "originalTotalSize": original_total_size,
-        "mergedSize": len(merged_bytes),
+        "mergedSize": merged_size,
+        "resultKey": result_key,
     }
+    if compress:
+        response_data["compressedKey"] = result_key
+        response_data["compressedSize"] = compressed_size
+
+    return response_data
 
 
 @app.post("/admin/trigger-cleanup")
