@@ -9,7 +9,6 @@ def merge_pdfs(input_pdfs: list[bytes]) -> bytes:
         raise ValueError("At least two PDF files are required for merging.")
 
     merged_doc = fitz.open()
-    opened_docs: list[fitz.Document] = []
 
     try:
         for index, pdf_bytes in enumerate(input_pdfs, start=1):
@@ -19,18 +18,16 @@ def merge_pdfs(input_pdfs: list[bytes]) -> bytes:
                 raise ValueError(f"Input PDF #{index} does not appear to be a valid PDF.")
 
             source_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            opened_docs.append(source_doc)
-
-            if source_doc.is_encrypted:
-                raise ValueError(f"Input PDF #{index} is encrypted and cannot be merged.")
-
-            merged_doc.insert_pdf(source_doc)
+            try:
+                if source_doc.is_encrypted:
+                    raise ValueError(f"Input PDF #{index} is encrypted and cannot be merged.")
+                merged_doc.insert_pdf(source_doc)
+            finally:
+                source_doc.close()  # free immediately after inserting
 
         if merged_doc.page_count == 0:
             raise ValueError("Merged PDF is empty.")
 
         return merged_doc.tobytes(garbage=4, deflate=True, deflate_fonts=True, clean=True)
     finally:
-        for source_doc in opened_docs:
-            source_doc.close()
         merged_doc.close()

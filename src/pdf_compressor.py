@@ -146,7 +146,6 @@ def _recompress_one(doc: fitz.Document, page: fitz.Page, xref: int) -> None:
     needs_resize = w > MAX_IMAGE_DIM or h > MAX_IMAGE_DIM
 
     if needs_resize:
-        img = img.copy()
         img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM), Image.LANCZOS)
 
     # Flatten RGBA → RGB (composited over white) so JPEG can encode it

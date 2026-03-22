@@ -201,6 +201,7 @@ async def compress(request: Request):
         raise HTTPException(status_code=422, detail=f"PDF compression failed: {exc}")
 
     compressed_size = len(compressed_bytes)
+    del original_bytes  # free source bytes — no longer needed
     log.info(
         "[INFO] Compressed size: %d bytes (ratio: %.1f%%)",
         compressed_size, compressed_size / original_size * 100,
@@ -292,23 +293,26 @@ async def merge(request: Request):
         log.error("[ERROR] Merge failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to merge PDF files")
 
+    del source_pdfs  # free source PDF bytes — no longer needed
+
     merged_key = _build_merged_key(normalized_keys[0])
     result_key = merged_key
-    result_bytes = merged_bytes
     merged_size = len(merged_bytes)
     compressed_size = None
 
     if compress:
         try:
-            compressed_bytes = compress_pdf(merged_bytes)
+            result_bytes = compress_pdf(merged_bytes)
+            del merged_bytes  # free uncompressed merged PDF
             compressed_key = _build_compressed_key(merged_key)
             result_key = compressed_key
-            result_bytes = compressed_bytes
-            compressed_size = len(compressed_bytes)
+            compressed_size = len(result_bytes)
             log.info("[INFO] Compressed merged PDF: %d -> %d bytes", merged_size, compressed_size)
         except Exception as exc:
             log.error("[ERROR] Compression after merge failed: %s", exc)
             raise HTTPException(status_code=422, detail=f"Compression after merge failed: {exc}")
+    else:
+        result_bytes = merged_bytes
 
     try:
         s3.put_object(
