@@ -6,3 +6,5 @@ apscheduler
 python-dotenv
 Pillow
 
+easyocr
+
