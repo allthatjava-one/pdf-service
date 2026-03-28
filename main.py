@@ -34,6 +34,7 @@ import io
 import logging
 import os
 import traceback
+import json
 from contextlib import asynccontextmanager
 
 import boto3
@@ -49,6 +50,11 @@ from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
 from src.pdf_merge import merge_pdfs
 from src.presigned_url import generate_presigned_url
+from src.pdf_convert import convert_pdf
+import asyncio
+
+# limit concurrent OCR conversions to avoid memory spikes
+_OCR_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_OCR", "1")))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -353,6 +359,94 @@ async def merge(request: Request):
         response_data["compressedSize"] = compressed_size
 
     return response_data
+
+
+@app.post("/convert")
+async def convert(request: Request):
+    body = await request.json()
+    object_key: str | None = body.get("objectKey") if isinstance(body, dict) else None
+    convert_type: str | None = body.get("convertType") if isinstance(body, dict) else None
+    languages = body.get("languages") if isinstance(body, dict) else None
+    # Default to English when languages not provided
+    if not languages:
+        languages = ["en"]
+    quality: str | None = body.get("quality") if isinstance(body, dict) else None
+
+    if not object_key or not isinstance(object_key, str) or not object_key.strip():
+        raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
+    if not convert_type or not isinstance(convert_type, str):
+        raise HTTPException(status_code=400, detail="Missing or invalid field: 'convertType'")
+
+    object_key = object_key.strip()
+    convert_type = convert_type.strip().lower()
+    allowed = {"text", "jpg", "png"}
+    if convert_type not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported convertType. Allowed: {sorted(allowed)}")
+
+    log.info("[INFO] /convert request for key=%r type=%r languages=%r", object_key, convert_type, languages)
+
+    s3 = _r2_client()
+    bucket = _env("R2_BUCKET_NAME")
+
+    try:
+        response = s3.get_object(Bucket=bucket, Key=object_key)
+        original_bytes = response["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+    except Exception as exc:
+        log.error("[ERROR] R2 fetch failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+
+    # OCR engine selection (default: easyocr) only needed for text extraction
+    try:
+        ocr_engine = os.environ.get("OCR_ENGINE", "easyocr").lower() if convert_type == "text" else None
+        if convert_type == "text":
+            log.info("Using OCR engine: %s", ocr_engine)
+
+        # throttle concurrent OCR-heavy conversions when doing OCR
+        if convert_type == "text":
+            async with _OCR_SEMAPHORE:
+                converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=ocr_engine)
+        else:
+            converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=None)
+    except Exception as exc:
+        log.error("[ERROR] Conversion failed: %s", exc)
+        raise HTTPException(status_code=422, detail=f"PDF conversion failed: {exc}")
+
+    ext = "txt" if convert_type == "text" else "zip"
+    # Normalize key to avoid repeated `.converted` suffixes.
+    # If the original key already contains a `.converted` suffix, strip it first.
+    import re
+
+    base_key = re.sub(r"\.converted(?:\.[^.]+)?$", "", object_key)
+    converted_key = f"{base_key}.converted.{ext}"
+
+    try:
+        s3.put_object(Bucket=bucket, Key=converted_key, Body=io.BytesIO(converted_bytes), ContentType=content_type)
+    except Exception as exc:
+        log.error("[ERROR] R2 put failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store converted file in R2")
+
+    try:
+        expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+        presigned = generate_presigned_url(
+            account_id=_env("R2_ACCOUNT_ID"),
+            access_key_id=_env("R2_ACCESS_KEY_ID"),
+            secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+            bucket_name=bucket,
+            object_key=converted_key,
+            expires_in=expiry_minutes * 60,
+        )
+    except Exception as exc:
+        log.error("[ERROR] Presigned URL generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+
+    return {
+        "success": True,
+        "presignedUrl": presigned,
+        "originalKey": object_key,
+        "convertedSize": len(converted_bytes),
+    }
 
 
 @app.post("/admin/trigger-cleanup")
