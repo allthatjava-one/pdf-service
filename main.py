@@ -379,7 +379,7 @@ async def convert(request: Request):
 
     object_key = object_key.strip()
     convert_type = convert_type.strip().lower()
-    allowed = {"text", "jpg", "png"}
+    allowed = {"jpg", "png"}
     if convert_type not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported convertType. Allowed: {sorted(allowed)}")
 
@@ -397,23 +397,15 @@ async def convert(request: Request):
         log.error("[ERROR] R2 fetch failed: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
 
-    # OCR engine selection (default: easyocr) only needed for text extraction
+    # Text (OCR) conversion has been removed to reduce application size.
+    # Only page image exports (jpg/png as a ZIP) are supported.
     try:
-        ocr_engine = os.environ.get("OCR_ENGINE", "easyocr").lower() if convert_type == "text" else None
-        if convert_type == "text":
-            log.info("Using OCR engine: %s", ocr_engine)
-
-        # throttle concurrent OCR-heavy conversions when doing OCR
-        if convert_type == "text":
-            async with _OCR_SEMAPHORE:
-                converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=ocr_engine)
-        else:
-            converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=None)
+        converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=None)
     except Exception as exc:
         log.error("[ERROR] Conversion failed: %s", exc)
         raise HTTPException(status_code=422, detail=f"PDF conversion failed: {exc}")
 
-    ext = "txt" if convert_type == "text" else "zip"
+    ext = "zip"
     # Normalize key to avoid repeated `.converted` suffixes.
     # If the original key already contains a `.converted` suffix, strip it first.
     import re
