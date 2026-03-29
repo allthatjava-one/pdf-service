@@ -55,6 +55,8 @@ import asyncio
 
 # limit concurrent OCR conversions to avoid memory spikes
 _OCR_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_OCR", "1")))
+# limit concurrent heavy tasks (compress/merge/convert) to avoid memory spikes
+_HEAVY_TASK_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_HEAVY_TASKS", "1")))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -186,47 +188,54 @@ async def compress(request: Request):
     s3 = _r2_client()
     bucket = _env("R2_BUCKET_NAME")
 
-    # --- Fetch original file from R2 ---
+    # Serialize heavy work to avoid concurrent memory spikes
+    await _HEAVY_TASK_SEMAPHORE.acquire()
+    log.info("[QUEUE] Acquired heavy task slot for /compress")
     try:
-        response = s3.get_object(Bucket=bucket, Key=object_key)
-        original_bytes = response["Body"].read()
-    except s3.exceptions.NoSuchKey:
-        raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
-    except Exception as exc:
-        log.error("[ERROR] R2 fetch failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+        # --- Fetch original file from R2 ---
+        try:
+            response = s3.get_object(Bucket=bucket, Key=object_key)
+            original_bytes = response["Body"].read()
+        except s3.exceptions.NoSuchKey:
+            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+        except Exception as exc:
+            log.error("[ERROR] R2 fetch failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
 
-    original_size = len(original_bytes)
-    log.info("[INFO] Original size: %d bytes", original_size)
+        original_size = len(original_bytes)
+        log.info("[INFO] Original size: %d bytes", original_size)
 
-    # --- Compress ---
-    try:
-        compressed_bytes = compress_pdf(original_bytes)
-    except Exception as exc:
-        log.error("[ERROR] Compression failed: %s", exc)
-        raise HTTPException(status_code=422, detail=f"PDF compression failed: {exc}")
+        # --- Compress ---
+        try:
+            compressed_bytes = compress_pdf(original_bytes)
+        except Exception as exc:
+            log.error("[ERROR] Compression failed: %s", exc)
+            raise HTTPException(status_code=422, detail=f"PDF compression failed: {exc}")
 
-    compressed_size = len(compressed_bytes)
-    del original_bytes  # free source bytes — no longer needed
-    log.info(
-        "[INFO] Compressed size: %d bytes (ratio: %.1f%%)",
-        compressed_size, compressed_size / original_size * 100,
-    )
-
-    # --- Store compressed file back to R2 ---
-    compressed_key = _build_compressed_key(object_key)
-    try:
-        s3.put_object(
-            Bucket=bucket,
-            Key=compressed_key,
-            Body=io.BytesIO(compressed_bytes),
-            ContentType="application/pdf",
+        compressed_size = len(compressed_bytes)
+        del original_bytes  # free source bytes — no longer needed
+        log.info(
+            "[INFO] Compressed size: %d bytes (ratio: %.1f%%)",
+            compressed_size, compressed_size / original_size * 100,
         )
-    except Exception as exc:
-        log.error("[ERROR] R2 put failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to store compressed file in R2")
 
-    log.info("[INFO] Stored compressed file as: %r", compressed_key)
+        # --- Store compressed file back to R2 ---
+        compressed_key = _build_compressed_key(object_key)
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=compressed_key,
+                Body=io.BytesIO(compressed_bytes),
+                ContentType="application/pdf",
+            )
+        except Exception as exc:
+            log.error("[ERROR] R2 put failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to store compressed file in R2")
+
+        log.info("[INFO] Stored compressed file as: %r", compressed_key)
+    finally:
+        _HEAVY_TASK_SEMAPHORE.release()
+        log.info("[QUEUE] Released heavy task slot for /compress")
 
     # --- Generate presigned URL ---
     try:
@@ -275,61 +284,69 @@ async def merge(request: Request):
 
     s3 = _r2_client()
     bucket = _env("R2_BUCKET_NAME")
-    source_pdfs: list[bytes] = []
-    original_total_size = 0
 
-    for object_key in normalized_keys:
-        try:
-            response = s3.get_object(Bucket=bucket, Key=object_key)
-            pdf_bytes = response["Body"].read()
-        except s3.exceptions.NoSuchKey:
-            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
-        except Exception as exc:
-            log.error("[ERROR] R2 fetch failed for %r: %s", object_key, exc)
-            raise HTTPException(status_code=500, detail="Failed to fetch objects from R2")
-
-        source_pdfs.append(pdf_bytes)
-        original_total_size += len(pdf_bytes)
-
+    # Serialize heavy work to avoid concurrent memory spikes
+    await _HEAVY_TASK_SEMAPHORE.acquire()
+    log.info("[QUEUE] Acquired heavy task slot for /merge")
     try:
-        merged_bytes = merge_pdfs(source_pdfs)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"PDF merge failed: {exc}")
-    except Exception as exc:
-        log.error("[ERROR] Merge failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to merge PDF files")
+        source_pdfs: list[bytes] = []
+        original_total_size = 0
 
-    del source_pdfs  # free source PDF bytes — no longer needed
+        for object_key in normalized_keys:
+            try:
+                response = s3.get_object(Bucket=bucket, Key=object_key)
+                pdf_bytes = response["Body"].read()
+            except s3.exceptions.NoSuchKey:
+                raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+            except Exception as exc:
+                log.error("[ERROR] R2 fetch failed for %r: %s", object_key, exc)
+                raise HTTPException(status_code=500, detail="Failed to fetch objects from R2")
 
-    merged_key = _build_merged_key(normalized_keys[0])
-    result_key = merged_key
-    merged_size = len(merged_bytes)
-    compressed_size = None
+            source_pdfs.append(pdf_bytes)
+            original_total_size += len(pdf_bytes)
 
-    if compress:
         try:
-            result_bytes = compress_pdf(merged_bytes)
-            del merged_bytes  # free uncompressed merged PDF
-            compressed_key = _build_compressed_key(merged_key)
-            result_key = compressed_key
-            compressed_size = len(result_bytes)
-            log.info("[INFO] Compressed merged PDF: %d -> %d bytes", merged_size, compressed_size)
+            merged_bytes = merge_pdfs(source_pdfs)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"PDF merge failed: {exc}")
         except Exception as exc:
-            log.error("[ERROR] Compression after merge failed: %s", exc)
-            raise HTTPException(status_code=422, detail=f"Compression after merge failed: {exc}")
-    else:
-        result_bytes = merged_bytes
+            log.error("[ERROR] Merge failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to merge PDF files")
 
-    try:
-        s3.put_object(
-            Bucket=bucket,
-            Key=result_key,
-            Body=io.BytesIO(result_bytes),
-            ContentType="application/pdf",
-        )
-    except Exception as exc:
-        log.error("[ERROR] R2 put failed for merged/compressed file: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to store merged/compressed file in R2")
+        del source_pdfs  # free source PDF bytes — no longer needed
+
+        merged_key = _build_merged_key(normalized_keys[0])
+        result_key = merged_key
+        merged_size = len(merged_bytes)
+        compressed_size = None
+
+        if compress:
+            try:
+                result_bytes = compress_pdf(merged_bytes)
+                del merged_bytes  # free uncompressed merged PDF
+                compressed_key = _build_compressed_key(merged_key)
+                result_key = compressed_key
+                compressed_size = len(result_bytes)
+                log.info("[INFO] Compressed merged PDF: %d -> %d bytes", merged_size, compressed_size)
+            except Exception as exc:
+                log.error("[ERROR] Compression after merge failed: %s", exc)
+                raise HTTPException(status_code=422, detail=f"Compression after merge failed: {exc}")
+        else:
+            result_bytes = merged_bytes
+
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=result_key,
+                Body=io.BytesIO(result_bytes),
+                ContentType="application/pdf",
+            )
+        except Exception as exc:
+            log.error("[ERROR] R2 put failed for merged/compressed file: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to store merged/compressed file in R2")
+    finally:
+        _HEAVY_TASK_SEMAPHORE.release()
+        log.info("[QUEUE] Released heavy task slot for /merge")
 
     try:
         expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
@@ -388,24 +405,31 @@ async def convert(request: Request):
     s3 = _r2_client()
     bucket = _env("R2_BUCKET_NAME")
 
+    # Serialize heavy work to avoid concurrent memory spikes
+    await _HEAVY_TASK_SEMAPHORE.acquire()
+    log.info("[QUEUE] Acquired heavy task slot for /convert")
     try:
-        response = s3.get_object(Bucket=bucket, Key=object_key)
-        original_bytes = response["Body"].read()
-    except s3.exceptions.NoSuchKey:
-        raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
-    except Exception as exc:
-        log.error("[ERROR] R2 fetch failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+        try:
+            response = s3.get_object(Bucket=bucket, Key=object_key)
+            original_bytes = response["Body"].read()
+        except s3.exceptions.NoSuchKey:
+            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+        except Exception as exc:
+            log.error("[ERROR] R2 fetch failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
 
-    # Text (OCR) conversion has been removed to reduce application size.
-    # Only page image exports (jpg/png as a ZIP) are supported.
-    try:
-        converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=None)
-    except Exception as exc:
-        log.error("[ERROR] Conversion failed: %s", exc)
-        raise HTTPException(status_code=422, detail=f"PDF conversion failed: {exc}")
+        # Text (OCR) conversion has been removed to reduce application size.
+        # Only page image exports (jpg/png as a ZIP) are supported.
+        try:
+            converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=None)
+        except Exception as exc:
+            log.error("[ERROR] Conversion failed: %s", exc)
+            raise HTTPException(status_code=422, detail=f"PDF conversion failed: {exc}")
 
-    ext = "zip"
+        ext = "zip"
+    finally:
+        _HEAVY_TASK_SEMAPHORE.release()
+        log.info("[QUEUE] Released heavy task slot for /convert")
     # Normalize key to avoid repeated `.converted` suffixes.
     # If the original key already contains a `.converted` suffix, strip it first.
     import re
