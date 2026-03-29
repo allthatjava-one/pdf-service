@@ -53,8 +53,6 @@ from src.presigned_url import generate_presigned_url
 from src.pdf_convert import convert_pdf
 import asyncio
 
-# limit concurrent OCR conversions to avoid memory spikes
-_OCR_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_OCR", "1")))
 # limit concurrent heavy tasks (compress/merge/convert) to avoid memory spikes
 _HEAVY_TASK_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_HEAVY_TASKS", "1")))
 
