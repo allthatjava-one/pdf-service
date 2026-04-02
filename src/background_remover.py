@@ -14,14 +14,26 @@ from PIL import Image, ImageStat
 
 log = logging.getLogger(__name__)
 
-_REMBG_AVAILABLE = False
-try:
-    # rembg exposes a convenient `remove` function that accepts bytes
-    # and returns processed bytes (typically a PNG with alpha channel).
-    from rembg import remove as _rembg_remove  # type: ignore
-    _REMBG_AVAILABLE = True
-except Exception:
-    _REMBG_AVAILABLE = False
+
+def _get_rembg_remove():
+    """Try to import and return the `rembg.remove` function.
+
+    This import is performed lazily so that installing `rembg` can be
+    deferred until an administrator explicitly triggers it.
+
+    Returns:
+        callable: `rembg.remove` when available
+
+    Raises:
+        ImportError: when `rembg` is not installed in the environment
+    """
+    import importlib
+
+    try:
+        rembg = importlib.import_module("rembg")
+        return getattr(rembg, "remove")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise ImportError("rembg is not available") from exc
 
 
 def _sample_corner_color(img: Image.Image, box_size: int = 6) -> Tuple[int, int, int]:
@@ -99,11 +111,13 @@ def remove_background_image(
     blur_map = {"light": 5, "medium": 15, "strong": 30}
     radius = blur_map.get(blur_strength, 15)
 
-    # obtain a foreground mask via rembg or heuristic
+    # obtain a foreground mask via rembg or heuristic (lazy import)
     try:
-        if _REMBG_AVAILABLE:
+        try:
+            _rembg_remove = _get_rembg_remove()
             fg_png = _rembg_remove(image_bytes)
-        else:
+        except ImportError:
+            log.info("rembg not available; using heuristic segmentation")
             fg_png = _heuristic_remove(image_bytes, threshold=threshold)
     except Exception as exc:
         log.warning("background segmentation failed (%s), falling back to heuristic", exc)

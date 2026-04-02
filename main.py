@@ -579,3 +579,49 @@ async def trigger_cleanup(authorization: str = Header(default="")):
     except Exception as exc:
         log.error("[ERROR] Cleanup failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}")
+
+
+@app.post("/admin/install-rembg")
+async def install_rembg(authorization: str = Header(default="")):
+    """Admin endpoint to install the optional `rembg` package at runtime.
+
+    This allows postponing the heavy `rembg` installation until an
+    administrator explicitly triggers it. The endpoint runs `pip` in the
+    running Python environment and attempts to import `rembg` after
+    installation. Protected by `ADMIN_SECRET`.
+    """
+    admin_secret = _env("ADMIN_SECRET")
+    if not admin_secret:
+        raise HTTPException(status_code=500, detail="ADMIN_SECRET is not configured")
+    if authorization != f"Bearer {admin_secret}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    import sys
+    import importlib
+
+    cmd = [sys.executable, "-m", "pip", "install", "rembg[cpu]"]
+    log.info("[ADMIN] Running install command: %r", cmd)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        out = (stdout or b"").decode(errors="ignore").strip()
+        err = (stderr or b"").decode(errors="ignore").strip()
+        if proc.returncode != 0:
+            log.error("[ADMIN] rembg install failed: %s", err)
+            raise HTTPException(status_code=500, detail=f"rembg install failed: {err}")
+
+        importlib.invalidate_caches()
+        try:
+            importlib.import_module("rembg")
+        except Exception as exc:
+            log.error("[ADMIN] rembg installed but cannot be imported: %s", exc)
+            raise HTTPException(status_code=500, detail="rembg installed but cannot be imported")
+
+        return {"success": True, "output": out, "error": err}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("[ADMIN] rembg install failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"rembg install failed: {exc}")
