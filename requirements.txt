@@ -5,7 +5,5 @@ boto3
 apscheduler
 python-dotenv
 Pillow
-Pillow
-rembg[cpu]
 
 
