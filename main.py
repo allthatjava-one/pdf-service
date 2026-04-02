@@ -48,10 +48,9 @@ from fastapi.responses import JSONResponse
 
 from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
-from src.pdf_merger import merge_pdfs
+from src.pdf_merge import merge_pdfs
 from src.presigned_url import generate_presigned_url
-from src.pdf_converter import convert_pdf
-from src.background_remover import remove_background_image
+from src.pdf_convert import convert_pdf
 import asyncio
 
 # limit concurrent heavy tasks (compress/merge/convert) to avoid memory spikes
@@ -108,21 +107,6 @@ def _build_merged_key(original_key: str) -> str:
         name, _, ext = original_key.rpartition(".")
         return f"{name}-merged.{ext}"
     return f"{original_key}-merged"
-
-
-def _build_bg_output_key(original_key: str, proc_type: str = "remove") -> str:
-    """Build output key for background operations.
-
-    If proc_type == 'remove' the suffix will be '-bg-removed' and extension will be 'png'.
-    If proc_type == 'blur' the suffix will be '-bg-blurred' and original extension is preserved.
-    """
-    suffix = "bg-removed" if (proc_type or "remove").lower() == "remove" else "bg-blurred"
-    if "." in original_key.split("/")[-1]:
-        name, _, ext = original_key.rpartition(".")
-        ext = ext.lower()
-        out_ext = "png" if suffix == "bg-removed" else ext
-        return f"{name}-{suffix}.{out_ext}"
-    return f"{original_key}-{suffix}.png"
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +245,6 @@ async def compress(request: Request):
             bucket_name=bucket,
             object_key=compressed_key,
             expires_in=expiry_minutes * 60,
-            custom_domain=_env("PRESIGNED_CUSTOM_DOMAIN") or None,
-            custom_domain_is_bucket_root=( _env("PRESIGNED_CUSTOM_DOMAIN_IS_BUCKET_ROOT", "").lower() in ("1","true","yes") ),
         )
     except Exception as exc:
         log.error("[ERROR] Presigned URL generation failed: %s", exc)
@@ -373,8 +355,6 @@ async def merge(request: Request):
             bucket_name=bucket,
             object_key=result_key,
             expires_in=expiry_minutes * 60,
-            custom_domain=_env("PRESIGNED_CUSTOM_DOMAIN") or None,
-            custom_domain_is_bucket_root=( _env("PRESIGNED_CUSTOM_DOMAIN_IS_BUCKET_ROOT", "").lower() in ("1","true","yes") ),
         )
     except Exception as exc:
         log.error("[ERROR] Presigned URL generation failed for merged/compressed file: %s", exc)
@@ -470,8 +450,6 @@ async def convert(request: Request):
             bucket_name=bucket,
             object_key=converted_key,
             expires_in=expiry_minutes * 60,
-            custom_domain=_env("PRESIGNED_CUSTOM_DOMAIN") or None,
-            custom_domain_is_bucket_root=( _env("PRESIGNED_CUSTOM_DOMAIN_IS_BUCKET_ROOT", "").lower() in ("1","true","yes") ),
         )
     except Exception as exc:
         log.error("[ERROR] Presigned URL generation failed: %s", exc)
@@ -483,81 +461,6 @@ async def convert(request: Request):
         "originalKey": object_key,
         "convertedSize": len(converted_bytes),
     }
-
-
-@app.post("/remove-background")
-async def remove_background_endpoint(request: Request):
-    body = await request.json()
-    object_key: str | None = body.get("objectKey") if isinstance(body, dict) else None
-    if not object_key or not isinstance(object_key, str) or not object_key.strip():
-        raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
-
-    object_key = object_key.strip()
-    log.info("[INFO] /remove-background request for key: %r", object_key)
-
-    s3 = _r2_client()
-    bucket = _env("R2_BUCKET_NAME")
-
-    # Serialize heavy work
-    await _HEAVY_TASK_SEMAPHORE.acquire()
-    log.info("[QUEUE] Acquired heavy task slot for /remove-background")
-    try:
-        try:
-            response = s3.get_object(Bucket=bucket, Key=object_key)
-            original_bytes = response["Body"].read()
-        except s3.exceptions.NoSuchKey:
-            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
-        except Exception as exc:
-            log.error("[ERROR] R2 fetch failed: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
-
-        # parse optional params
-        req_type: str | None = body.get("type") if isinstance(body, dict) else None
-        quality: str | None = body.get("quality") if isinstance(body, dict) else None
-        blur_strength: str | None = body.get("blur-strength") if isinstance(body, dict) else None
-
-        # default values handled by remove_background_image
-        try:
-            processed_bytes = remove_background_image(
-                original_bytes,
-                type=req_type or "remove",
-                quality=quality or "medium",
-                blur_strength=blur_strength or "medium",
-            )
-        except Exception as exc:
-            log.error("[ERROR] Background removal failed: %s", exc)
-            raise HTTPException(status_code=422, detail=f"Background removal failed: {exc}")
-
-        result_key = _build_bg_output_key(object_key, proc_type=(req_type or "remove"))
-        try:
-            # ContentType: PNG for remove, otherwise infer from result key extension
-            res_ext = result_key.rpartition(".")[2].lower()
-            content_type = "image/png" if res_ext == "png" else ("image/jpeg" if res_ext in ("jpg", "jpeg") else "application/octet-stream")
-            s3.put_object(Bucket=bucket, Key=result_key, Body=io.BytesIO(processed_bytes), ContentType=content_type)
-        except Exception as exc:
-            log.error("[ERROR] R2 put failed for background-removed file: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to store processed file in R2")
-    finally:
-        _HEAVY_TASK_SEMAPHORE.release()
-        log.info("[QUEUE] Released heavy task slot for /remove-background")
-
-    try:
-        expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
-        presigned = generate_presigned_url(
-            account_id=_env("R2_ACCOUNT_ID"),
-            access_key_id=_env("R2_ACCESS_KEY_ID"),
-            secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
-            bucket_name=bucket,
-            object_key=result_key,
-            expires_in=expiry_minutes * 60,
-            custom_domain=_env("PRESIGNED_CUSTOM_DOMAIN") or None,
-            custom_domain_is_bucket_root=( _env("PRESIGNED_CUSTOM_DOMAIN_IS_BUCKET_ROOT", "").lower() in ("1","true","yes") ),
-        )
-    except Exception as exc:
-        log.error("[ERROR] Presigned URL generation failed for background-removed file: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
-
-    return {"success": True, "bgRemovedKey": result_key, "presignedUrl": presigned}
 
 
 @app.post("/admin/trigger-cleanup")
@@ -579,49 +482,3 @@ async def trigger_cleanup(authorization: str = Header(default="")):
     except Exception as exc:
         log.error("[ERROR] Cleanup failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Cleanup failed: {exc}")
-
-
-@app.post("/admin/install-rembg")
-async def install_rembg(authorization: str = Header(default="")):
-    """Admin endpoint to install the optional `rembg` package at runtime.
-
-    This allows postponing the heavy `rembg` installation until an
-    administrator explicitly triggers it. The endpoint runs `pip` in the
-    running Python environment and attempts to import `rembg` after
-    installation. Protected by `ADMIN_SECRET`.
-    """
-    admin_secret = _env("ADMIN_SECRET")
-    if not admin_secret:
-        raise HTTPException(status_code=500, detail="ADMIN_SECRET is not configured")
-    if authorization != f"Bearer {admin_secret}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    import sys
-    import importlib
-
-    cmd = [sys.executable, "-m", "pip", "install", "rembg[cpu]"]
-    log.info("[ADMIN] Running install command: %r", cmd)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        out = (stdout or b"").decode(errors="ignore").strip()
-        err = (stderr or b"").decode(errors="ignore").strip()
-        if proc.returncode != 0:
-            log.error("[ADMIN] rembg install failed: %s", err)
-            raise HTTPException(status_code=500, detail=f"rembg install failed: {err}")
-
-        importlib.invalidate_caches()
-        try:
-            importlib.import_module("rembg")
-        except Exception as exc:
-            log.error("[ADMIN] rembg installed but cannot be imported: %s", exc)
-            raise HTTPException(status_code=500, detail="rembg installed but cannot be imported")
-
-        return {"success": True, "output": out, "error": err}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.error("[ADMIN] rembg install failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"rembg install failed: {exc}")
