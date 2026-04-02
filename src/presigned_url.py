@@ -47,6 +47,8 @@ def generate_presigned_url(
     expires_in: int = 3600,
     region: str = "auto",
     method: str = "GET",
+    custom_domain: str | None = None,
+    custom_domain_is_bucket_root: bool = False,
 ) -> str:
     """Return a presigned URL that allows unauthenticated access to *object_key*.
 
@@ -64,7 +66,8 @@ def generate_presigned_url(
         A fully-formed presigned URL string.
     """
     service = "s3"
-    host    = f"{account_id}.r2.cloudflarestorage.com"
+    # If a custom domain is provided (e.g. files.thrjtech.com), use it as the host
+    host = custom_domain if custom_domain else f"{account_id}.r2.cloudflarestorage.com"
 
     now        = datetime.now(timezone.utc)
     date_stamp = now.strftime("%Y%m%d")           # e.g. "20260314"
@@ -87,8 +90,13 @@ def generate_presigned_url(
     )
 
     # --- Canonical request ---
-    encoded_key        = urllib.parse.quote(object_key, safe="/")
-    canonical_uri      = f"/{bucket_name}/{encoded_key}"
+    encoded_key = urllib.parse.quote(object_key, safe="/")
+    # If custom_domain points directly to the bucket root, omit the bucket
+    # from the canonical URI (requests will be made to /<key> on that host).
+    if custom_domain and custom_domain_is_bucket_root:
+        canonical_uri = f"/{encoded_key}"
+    else:
+        canonical_uri = f"/{bucket_name}/{encoded_key}"
     canonical_headers  = f"host:{host}\n"
     signed_headers     = "host"
 
