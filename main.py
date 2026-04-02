@@ -48,9 +48,9 @@ from fastapi.responses import JSONResponse
 
 from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
-from src.pdf_merge import merge_pdfs
+from src.pdf_merger import merge_pdfs
 from src.presigned_url import generate_presigned_url
-from src.pdf_convert import convert_pdf
+from src.pdf_converter import convert_pdf
 import asyncio
 
 # limit concurrent heavy tasks (compress/merge/convert) to avoid memory spikes
