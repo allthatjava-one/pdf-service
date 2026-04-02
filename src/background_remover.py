@@ -15,25 +15,16 @@ from PIL import Image, ImageStat
 log = logging.getLogger(__name__)
 
 
-def _get_rembg_remove():
-    """Try to import and return the `rembg.remove` function.
-
-    This import is performed lazily so that installing `rembg` can be
-    deferred until an administrator explicitly triggers it.
-
-    Returns:
-        callable: `rembg.remove` when available
-
-    Raises:
-        ImportError: when `rembg` is not installed in the environment
-    """
-    import importlib
-
-    try:
-        rembg = importlib.import_module("rembg")
-        return getattr(rembg, "remove")
-    except Exception as exc:  # pragma: no cover - environment dependent
-        raise ImportError("rembg is not available") from exc
+# Try to import rembg at module load time. This makes rembg a hard
+# dependency for running the background remover (docker image should
+# include rembg). If import fails the code will fall back to heuristic
+# segmentation but the preferred path expects rembg to be installed.
+_REMBG_AVAILABLE = False
+try:
+    from rembg import remove as _rembg_remove  # type: ignore
+    _REMBG_AVAILABLE = True
+except Exception:
+    _REMBG_AVAILABLE = False
 
 
 def _sample_corner_color(img: Image.Image, box_size: int = 6) -> Tuple[int, int, int]:
@@ -111,12 +102,11 @@ def remove_background_image(
     blur_map = {"light": 5, "medium": 15, "strong": 30}
     radius = blur_map.get(blur_strength, 15)
 
-    # obtain a foreground mask via rembg or heuristic (lazy import)
+    # obtain a foreground mask via rembg or heuristic
     try:
-        try:
-            _rembg_remove = _get_rembg_remove()
+        if _REMBG_AVAILABLE:
             fg_png = _rembg_remove(image_bytes)
-        except ImportError:
+        else:
             log.info("rembg not available; using heuristic segmentation")
             fg_png = _heuristic_remove(image_bytes, threshold=threshold)
     except Exception as exc:
