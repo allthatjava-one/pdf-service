@@ -155,7 +155,7 @@ app = FastAPI(title="pdf-service", lifespan=lifespan)
 
 _origins_cfg = _env("ALLOWED_ORIGINS", "*")
 _origins = [o.strip() for o in _origins_cfg.split(",") if o.strip()] if _origins_cfg != "*" else ["*"]
-
+# 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
@@ -418,8 +418,12 @@ async def convert(request: Request):
 
         # Text (OCR) conversion has been removed to reduce application size.
         # Only page image exports (jpg/png as a ZIP) are supported.
+        # convert_pdf is synchronous and CPU-intensive; run it in a thread pool so the
+        # event loop stays responsive and Koyeb's reverse proxy does not time out.
         try:
-            converted_bytes, content_type = convert_pdf(original_bytes, convert_type, languages, ocr_engine=None)
+            converted_bytes, content_type = await asyncio.to_thread(
+                convert_pdf, original_bytes, convert_type, languages, None
+            )
         except Exception as exc:
             log.error("[ERROR] Conversion failed: %s", exc)
             raise HTTPException(status_code=422, detail=f"PDF conversion failed: {exc}")
