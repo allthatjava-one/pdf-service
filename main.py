@@ -50,11 +50,14 @@ from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
 from src.pdf_merger import merge_pdfs
 from src.presigned_url import generate_presigned_url
-from src.pdf_converter import convert_pdf
+from src.pdf_converter import convert_pdf, DEFAULT_DPI as _CONVERTER_DEFAULT_DPI
 import asyncio
 
 # limit concurrent heavy tasks (compress/merge/convert) to avoid memory spikes
 _HEAVY_TASK_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_HEAVY_TASKS", "1")))
+# Graceful timeout for /convert so FastAPI (with CORS headers) responds before
+# Koyeb's reverse-proxy timeout fires and returns a CORS-header-less 504.
+_CONVERT_TIMEOUT_SECONDS = int(os.environ.get("CONVERT_TIMEOUT_SECONDS", "55"))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -386,6 +389,18 @@ async def convert(request: Request):
     if not languages:
         languages = ["en"]
     quality: str | None = body.get("quality") if isinstance(body, dict) else None
+    # Optional DPI — lower values are faster; default is 96 (fine for web display).
+    # Koyeb has a per-request timeout; keeping DPI low prevents 504 → CORS errors.
+    raw_dpi = body.get("dpi") if isinstance(body, dict) else None
+    if raw_dpi is None:
+        dpi = _CONVERTER_DEFAULT_DPI
+    else:
+        try:
+            dpi = int(raw_dpi)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="'dpi' must be an integer (72–300)")
+        if not (72 <= dpi <= 300):
+            raise HTTPException(status_code=400, detail="'dpi' must be between 72 and 300")
 
     if not object_key or not isinstance(object_key, str) or not object_key.strip():
         raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
@@ -398,7 +413,7 @@ async def convert(request: Request):
     if convert_type not in allowed:
         raise HTTPException(status_code=400, detail=f"Unsupported convertType. Allowed: {sorted(allowed)}")
 
-    log.info("[INFO] /convert request for key=%r type=%r languages=%r", object_key, convert_type, languages)
+    log.info("[INFO] /convert request for key=%r type=%r dpi=%d languages=%r", object_key, convert_type, dpi, languages)
 
     s3 = _r2_client()
     bucket = _env("R2_BUCKET_NAME")
@@ -420,9 +435,21 @@ async def convert(request: Request):
         # Only page image exports (jpg/png as a ZIP) are supported.
         # convert_pdf is synchronous and CPU-intensive; run it in a thread pool so the
         # event loop stays responsive and Koyeb's reverse proxy does not time out.
+        # asyncio.wait_for ensures FastAPI (with CORS headers) responds before Koyeb's
+        # proxy timeout fires, which would return a 504 with no CORS headers.
         try:
-            converted_bytes, content_type = await asyncio.to_thread(
-                convert_pdf, original_bytes, convert_type, languages, None
+            converted_bytes, content_type = await asyncio.wait_for(
+                asyncio.to_thread(convert_pdf, original_bytes, convert_type, languages, None, dpi),
+                timeout=_CONVERT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            log.error("[ERROR] Conversion timed out after %ds (dpi=%d)", _CONVERT_TIMEOUT_SECONDS, dpi)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"PDF conversion timed out after {_CONVERT_TIMEOUT_SECONDS}s. "
+                    "Try a smaller file or a lower 'dpi' value (e.g. 72 or 96)."
+                ),
             )
         except Exception as exc:
             log.error("[ERROR] Conversion failed: %s", exc)
