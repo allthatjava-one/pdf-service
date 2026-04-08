@@ -10,8 +10,8 @@ from PIL import Image
 
 log = logging.getLogger(__name__)
 
-# Default raster DPI for OCR rendering
-dpi = 150
+# Default raster DPI for image export (96 is fine for web; raise to 150–300 for print)
+DEFAULT_DPI = 96
 
 
 
@@ -32,7 +32,13 @@ def _langs_to_ocr(langs: List[str] | None) -> List[str]:
     return mapped
 
 
-def convert_pdf(input_bytes: bytes, convert_type: str, languages: List[str] | None = None, ocr_engine: str | None = None) -> Tuple[bytes, str]:
+def convert_pdf(
+    input_bytes: bytes,
+    convert_type: str,
+    languages: List[str] | None = None,
+    ocr_engine: str | None = None,
+    dpi: int = DEFAULT_DPI,
+) -> Tuple[bytes, str]:
     """Convert PDF to page images (jpg/png) and return a ZIP.
 
     Returns (bytes, content_type).

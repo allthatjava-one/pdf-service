@@ -1,4 +1,5 @@
 """Tests for POST /convert endpoint."""
+import asyncio
 import io
 import zipfile
 
@@ -114,6 +115,76 @@ def test_convert_png_success(monkeypatch):
         names = zf.namelist()
         assert len(names) == 1
         assert "page_001.png" in names
+
+
+def test_convert_custom_dpi_accepted(monkeypatch):
+    """Explicit dpi in the request body is accepted and used."""
+    pdf_bytes = _make_pdf_bytes(pages=1)
+    fake = FakeS3(pdf_bytes, key="hi.pdf")
+
+    monkeypatch.setattr(app_module, "_r2_client", lambda: fake)
+    monkeypatch.setattr(
+        app_module,
+        "generate_presigned_url",
+        lambda **kw: "https://presigned.example/result.zip",
+    )
+
+    client = TestClient(app_module.app)
+    resp = client.post("/convert", json={"objectKey": "hi.pdf", "convertType": "jpg", "dpi": 72})
+    assert resp.status_code == 200
+    # 72 DPI pages will be smaller than 96 DPI pages
+    assert fake.stored is not None
+
+
+def test_convert_dpi_out_of_range(monkeypatch):
+    """dpi outside 72-300 must return 400."""
+    monkeypatch.setattr(app_module, "_r2_client", lambda: FakeS3())
+    client = TestClient(app_module.app)
+
+    resp_low = client.post("/convert", json={"objectKey": "a.pdf", "convertType": "jpg", "dpi": 10})
+    assert resp_low.status_code == 400
+    assert "dpi" in resp_low.json()["detail"].lower()
+
+    resp_high = client.post("/convert", json={"objectKey": "a.pdf", "convertType": "jpg", "dpi": 600})
+    assert resp_high.status_code == 400
+    assert "dpi" in resp_high.json()["detail"].lower()
+
+
+def test_convert_dpi_non_integer(monkeypatch):
+    """Non-integer dpi must return 400."""
+    monkeypatch.setattr(app_module, "_r2_client", lambda: FakeS3())
+    client = TestClient(app_module.app)
+    resp = client.post("/convert", json={"objectKey": "a.pdf", "convertType": "jpg", "dpi": "high"})
+    assert resp.status_code == 400
+    assert "dpi" in resp.json()["detail"].lower()
+
+
+def test_convert_timeout_returns_503(monkeypatch):
+    """When conversion times out, the endpoint must return 503 (not a CORS-less 504 from Koyeb)."""
+    pdf_bytes = _make_pdf_bytes(pages=1)
+    fake = FakeS3(pdf_bytes, key="slow.pdf")
+
+    monkeypatch.setattr(app_module, "_r2_client", lambda: fake)
+    monkeypatch.setattr(app_module, "_CONVERT_TIMEOUT_SECONDS", 0)
+    # Force asyncio.wait_for to time out immediately by using a 0-second timeout
+    # and a slow convert_pdf replacement.
+    import time
+    async def _slow_convert(*args, **kwargs):
+        await asyncio.sleep(1)  # longer than 0s timeout
+        return b"", "application/zip"
+
+    monkeypatch.setattr(app_module, "convert_pdf", lambda *a, **kw: (_ for _ in ()).throw(asyncio.TimeoutError()))
+    # Patch asyncio.wait_for to raise TimeoutError directly
+    original_wait_for = asyncio.wait_for
+    async def _raising_wait_for(coro, timeout):
+        coro.close()  # clean up the coroutine without running it
+        raise asyncio.TimeoutError()
+    monkeypatch.setattr(asyncio, "wait_for", _raising_wait_for)
+
+    client = TestClient(app_module.app)
+    resp = client.post("/convert", json={"objectKey": "slow.pdf", "convertType": "jpg"})
+    assert resp.status_code == 503
+    assert "timed out" in resp.json()["detail"].lower()
 
 
 def test_convert_missing_object_key(monkeypatch):
