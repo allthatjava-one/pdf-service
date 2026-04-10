@@ -53,7 +53,11 @@ _SKIP_EXTS = {"jb2", "jbig2", "ccitt"}
 # Public API
 # ---------------------------------------------------------------------------
 
-def compress_pdf(input_bytes: bytes) -> bytes:
+def compress_pdf(
+    input_bytes: bytes,
+    image_quality: int = JPEG_QUALITY,
+    max_image_dim: int = MAX_IMAGE_DIM,
+) -> bytes:
     """Compress *input_bytes* (raw PDF) and return the compressed PDF bytes.
 
     Returns the original bytes unchanged if no reduction was achieved.
@@ -73,7 +77,7 @@ def compress_pdf(input_bytes: bytes) -> bytes:
         return input_bytes
 
     # Phase 1: re-encode embedded images
-    _recompress_images(doc)
+    _recompress_images(doc, image_quality=image_quality, max_image_dim=max_image_dim)
 
     # Phase 2: structural / stream compression
     # deflate_images intentionally omitted — images already handled above;
@@ -99,8 +103,13 @@ def compress_pdf(input_bytes: bytes) -> bytes:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _recompress_images(doc: fitz.Document) -> None:
-    """Re-encode every embedded image in *doc* in-place."""
+def _recompress_images(doc: fitz.Document, *, image_quality: int = JPEG_QUALITY, max_image_dim: int = MAX_IMAGE_DIM) -> None:
+    """Re-encode every embedded image in *doc* in-place.
+
+    Parameters:
+    - image_quality: JPEG quality to use when re-encoding (0-95)
+    - max_image_dim: longest-edge cap in pixels for resizing
+    """
     seen: set[int] = set()
     for page in doc:
         for img_info in page.get_images(full=True):
@@ -109,13 +118,24 @@ def _recompress_images(doc: fitz.Document) -> None:
                 continue
             seen.add(xref)
             try:
-                _recompress_one(doc, page, xref)
+                _recompress_one(doc, page, xref, image_quality=image_quality, max_image_dim=max_image_dim)
             except Exception as exc:
                 log.debug("Skipping image xref=%d: %s", xref, exc)
 
 
-def _recompress_one(doc: fitz.Document, page: fitz.Page, xref: int) -> None:
-    """Re-encode a single image xref as JPEG when it produces a smaller stream."""
+def _recompress_one(
+    doc: fitz.Document,
+    page: fitz.Page,
+    xref: int,
+    *,
+    image_quality: int = JPEG_QUALITY,
+    max_image_dim: int = MAX_IMAGE_DIM,
+) -> None:
+    """Re-encode a single image xref as JPEG when it produces a smaller stream.
+
+    Uses the provided `image_quality` and `max_image_dim` instead of module
+    defaults so callers can tune compression presets.
+    """
     base = doc.extract_image(xref)
     if not base:
         return
@@ -143,10 +163,10 @@ def _recompress_one(doc: fitz.Document, page: fitz.Page, xref: int) -> None:
         return
 
     w, h = img.size
-    needs_resize = w > MAX_IMAGE_DIM or h > MAX_IMAGE_DIM
+    needs_resize = w > max_image_dim or h > max_image_dim
 
     if needs_resize:
-        img.thumbnail((MAX_IMAGE_DIM, MAX_IMAGE_DIM), Image.LANCZOS)
+        img.thumbnail((max_image_dim, max_image_dim), Image.LANCZOS)
 
     # Flatten RGBA → RGB (composited over white) so JPEG can encode it
     if img.mode == "RGBA":
@@ -157,7 +177,7 @@ def _recompress_one(doc: fitz.Document, page: fitz.Page, xref: int) -> None:
         img = img.convert("RGB")
 
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+    img.save(out, format="JPEG", quality=image_quality, optimize=True)
     jpeg_bytes = out.getvalue()
 
     # Skip if no size saving and no resize

@@ -59,6 +59,13 @@ _HEAVY_TASK_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_HEA
 # Koyeb's reverse-proxy timeout fires and returns a CORS-header-less 504.
 _CONVERT_TIMEOUT_SECONDS = int(os.environ.get("CONVERT_TIMEOUT_SECONDS", "55"))
 
+# Compression presets for /compress endpoint
+_COMPRESS_PRESETS = {
+    "HQ": {"image_quality": 90, "max_image_dim": 2400},
+    "BALANCED": {"image_quality": 80, "max_image_dim": 1800},
+    "MAX": {"image_quality": 60, "max_image_dim": 1200},
+}
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
@@ -207,8 +214,23 @@ async def compress(request: Request):
         log.info("[INFO] Original size: %d bytes", original_size)
 
         # --- Compress ---
+        # Optional preset: HQ, BALANCED, MAX (default MAX)
+        option = body.get("option") if isinstance(body, dict) else None
+        if option is None:
+            option = "MAX"
         try:
-            compressed_bytes = compress_pdf(original_bytes)
+            option = option.strip().upper()
+        except Exception:
+            option = "MAX"
+
+        if option not in _COMPRESS_PRESETS:
+            raise HTTPException(status_code=400, detail=f"Invalid 'option'. Allowed: {sorted(_COMPRESS_PRESETS.keys())}")
+
+        preset = _COMPRESS_PRESETS[option]
+        log.info("[INFO] Compression option: %s (quality=%d, max_dim=%d)", option, preset["image_quality"], preset["max_image_dim"])
+
+        try:
+            compressed_bytes = compress_pdf(original_bytes, **preset)
         except Exception as exc:
             log.error("[ERROR] Compression failed: %s", exc)
             raise HTTPException(status_code=422, detail=f"PDF compression failed: {exc}")
