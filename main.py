@@ -49,6 +49,7 @@ from fastapi.responses import JSONResponse
 from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
 from src.pdf_merger import merge_pdfs
+from src.pdf_splitter import split_pdf
 from src.presigned_url import generate_presigned_url
 from src.pdf_converter import convert_pdf, DEFAULT_DPI as _CONVERTER_DEFAULT_DPI
 import asyncio
@@ -117,6 +118,23 @@ def _build_merged_key(original_key: str) -> str:
         name, _, ext = original_key.rpartition(".")
         return f"{name}-merged.{ext}"
     return f"{original_key}-merged"
+
+
+def _build_split_key(original_key: str, segment: str) -> str:
+    if "." in original_key.split("/")[-1]:
+        name, _, ext = original_key.rpartition(".")
+        return f"{name}-split-{segment}.{ext}"
+    return f"{original_key}-split-{segment}"
+
+
+def _build_split_combined_key(original_key: str) -> str:
+    if "." in original_key.split("/")[-1]:
+        name, _, ext = original_key.rpartition(".")
+        return f"{name}-split-combined.{ext}"
+    return f"{original_key}-split-combined"
+
+
+_SPLIT_OUTPUT_OPTIONS = {"ONE", "MULTIPLE"}
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +532,119 @@ async def convert(request: Request):
         "originalKey": object_key,
         "convertedSize": len(converted_bytes),
     }
+
+
+@app.post("/split")
+async def split(request: Request):
+    body = await request.json()
+    object_key: str | None = body.get("objectKey") if isinstance(body, dict) else None
+    split_option: str | None = body.get("splitOption") if isinstance(body, dict) else None
+    output_option = body.get("outputOption", "MULTIPLE") if isinstance(body, dict) else "MULTIPLE"
+
+    if not object_key or not isinstance(object_key, str) or not object_key.strip():
+        raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
+    if not split_option or not isinstance(split_option, str) or not split_option.strip():
+        raise HTTPException(status_code=400, detail="Missing or invalid field: 'splitOption'")
+    if not isinstance(output_option, str):
+        output_option = "MULTIPLE"
+    output_option = output_option.strip().upper()
+    if output_option not in _SPLIT_OUTPUT_OPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid 'outputOption'. Allowed: {sorted(_SPLIT_OUTPUT_OPTIONS)}",
+        )
+
+    object_key = object_key.strip()
+    split_option = split_option.strip()
+
+    log.info(
+        "[INFO] /split request for key=%r splitOption=%r outputOption=%r",
+        object_key, split_option, output_option,
+    )
+
+    s3 = _r2_client()
+    bucket = _env("R2_BUCKET_NAME")
+
+    await _HEAVY_TASK_SEMAPHORE.acquire()
+    log.info("[QUEUE] Acquired heavy task slot for /split")
+    try:
+        # --- Fetch source PDF from R2 ---
+        try:
+            response = s3.get_object(Bucket=bucket, Key=object_key)
+            original_bytes = response["Body"].read()
+        except s3.exceptions.NoSuchKey:
+            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+        except Exception as exc:
+            log.error("[ERROR] R2 fetch failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+
+        # --- Split (CPU-bound; run in thread pool) ---
+        try:
+            segments = await asyncio.to_thread(split_pdf, original_bytes, split_option)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"PDF split failed: {exc}")
+        except Exception as exc:
+            log.error("[ERROR] Split failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Failed to split PDF")
+
+        del original_bytes
+
+        expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+
+        def _upload_and_sign(key: str, data: bytes) -> str:
+            try:
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=io.BytesIO(data),
+                    ContentType="application/pdf",
+                )
+            except Exception as exc:
+                log.error("[ERROR] R2 put failed for key %r: %s", key, exc)
+                raise HTTPException(status_code=500, detail=f"Failed to store '{key}' in R2")
+            try:
+                return generate_presigned_url(
+                    account_id=_env("R2_ACCOUNT_ID"),
+                    access_key_id=_env("R2_ACCESS_KEY_ID"),
+                    secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+                    bucket_name=bucket,
+                    object_key=key,
+                    expires_in=expiry_minutes * 60,
+                )
+            except Exception as exc:
+                log.error("[ERROR] Presigned URL generation failed for key %r: %s", key, exc)
+                raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+
+        if output_option == "ONE":
+            # Merge all split segments into a single PDF, upload once, return one result entry.
+            if len(segments) == 1:
+                combined_bytes = segments[0][1]
+            else:
+                try:
+                    combined_bytes = merge_pdfs([seg_bytes for _, seg_bytes in segments])
+                except Exception as exc:
+                    log.error("[ERROR] Combining split segments failed: %s", exc)
+                    raise HTTPException(status_code=500, detail="Failed to combine split segments")
+
+            combined_key = _build_split_combined_key(object_key)
+            presigned = _upload_and_sign(combined_key, combined_bytes)
+            results = [{"segment": "combined", "url": presigned, "splitKey": combined_key}]
+        else:
+            # MULTIPLE: upload each segment separately.
+            results = []
+            for label, seg_bytes in segments:
+                split_key = _build_split_key(object_key, label)
+                presigned = _upload_and_sign(split_key, seg_bytes)
+                results.append({"segment": label, "url": presigned, "splitKey": split_key})
+
+        return {
+            "success": True,
+            "outputOption": output_option,
+            "results": results,
+        }
+    finally:
+        _HEAVY_TASK_SEMAPHORE.release()
+        log.info("[QUEUE] Released heavy task slot for /split")
 
 
 @app.post("/admin/trigger-cleanup")

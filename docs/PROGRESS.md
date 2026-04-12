@@ -2,6 +2,41 @@ Session progress log
 
 ---
 
+Session: PDF Splitter feature (Story_002_pdf_splitter)
+Date: 2026-04-12
+
+Summary:
+- Implemented `src/pdf_splitter.py`:
+  - `split_pdf(input_bytes, split_option)` — parses a comma-separated page/range
+    string (e.g. `"1,3,5-7"`) and returns a list of `(segment_label, pdf_bytes)` pairs.
+  - Validates: non-PDF bytes, encrypted PDFs, out-of-range pages, inverted ranges,
+    malformed tokens.
+- Added `POST /split` endpoint to `main.py`:
+  - Request body: `objectKey`, `splitOption`, `outputOption` (`"ONE"` | `"MULTIPLE"`, default `"MULTIPLE"`).
+  - `outputOption="MULTIPLE"`: uploads each segment separately to R2, returns
+    `{ "results": [{ "segment", "url", "splitKey" }, ...] }`.
+  - `outputOption="ONE"`: merges all split segments back into a single PDF (via
+    `merge_pdfs`; falls through to direct use when only 1 segment), uploads once,
+    returns `{ "presignedUrl", "splitKey" }`.
+  - Split runs in `asyncio.to_thread` (consistent with `/convert`) to avoid blocking the event loop.
+  - Wrapped in `_HEAVY_TASK_SEMAPHORE`.
+- Added helper functions `_build_split_key` and `_build_split_combined_key` in `main.py`.
+- Added `from src.pdf_splitter import split_pdf` import in `main.py`.
+- Tests added:
+  - `tests/test_pdf_splitter.py` — 16 unit tests covering all happy paths and validation errors.
+  - `tests/test_split_endpoint.py` — 12 integration tests covering both outputOption values and all error paths.
+- All 28 tests pass.
+
+Notes / Gotchas:
+- PyMuPDF `Document.save()` uses `owner_pw` / `user_pw` (not `owner_pass` / `user_pass`) for encryption.
+- For `outputOption="ONE"` with a single segment, `merge_pdfs` is skipped (requires ≥ 2 inputs);
+  the lone segment bytes are used directly.
+
+Remaining / follow-ups:
+- No known remaining tasks for this story.
+
+---
+
 Session: Fix /convert CORS error on Koyeb
 Date: 2026-04-08
 
