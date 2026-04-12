@@ -591,8 +591,32 @@ async def split(request: Request):
 
         expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
 
+        def _upload_and_sign(key: str, data: bytes) -> str:
+            try:
+                s3.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=io.BytesIO(data),
+                    ContentType="application/pdf",
+                )
+            except Exception as exc:
+                log.error("[ERROR] R2 put failed for key %r: %s", key, exc)
+                raise HTTPException(status_code=500, detail=f"Failed to store '{key}' in R2")
+            try:
+                return generate_presigned_url(
+                    account_id=_env("R2_ACCOUNT_ID"),
+                    access_key_id=_env("R2_ACCESS_KEY_ID"),
+                    secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+                    bucket_name=bucket,
+                    object_key=key,
+                    expires_in=expiry_minutes * 60,
+                )
+            except Exception as exc:
+                log.error("[ERROR] Presigned URL generation failed for key %r: %s", key, exc)
+                raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+
         if output_option == "ONE":
-            # --- Combine all segments into a single PDF ---
+            # Merge all split segments into a single PDF, upload once, return one result entry.
             if len(segments) == 1:
                 combined_bytes = segments[0][1]
             else:
@@ -603,75 +627,21 @@ async def split(request: Request):
                     raise HTTPException(status_code=500, detail="Failed to combine split segments")
 
             combined_key = _build_split_combined_key(object_key)
-            try:
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=combined_key,
-                    Body=io.BytesIO(combined_bytes),
-                    ContentType="application/pdf",
-                )
-            except Exception as exc:
-                log.error("[ERROR] R2 put failed: %s", exc)
-                raise HTTPException(status_code=500, detail="Failed to store split file in R2")
-
-            try:
-                presigned = generate_presigned_url(
-                    account_id=_env("R2_ACCOUNT_ID"),
-                    access_key_id=_env("R2_ACCESS_KEY_ID"),
-                    secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
-                    bucket_name=bucket,
-                    object_key=combined_key,
-                    expires_in=expiry_minutes * 60,
-                )
-            except Exception as exc:
-                log.error("[ERROR] Presigned URL generation failed: %s", exc)
-                raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
-
-            return {
-                "success": True,
-                "outputOption": "ONE",
-                "splitKey": combined_key,
-                "presignedUrl": presigned,
-            }
-
-        else:  # MULTIPLE
+            presigned = _upload_and_sign(combined_key, combined_bytes)
+            results = [{"segment": "combined", "url": presigned, "splitKey": combined_key}]
+        else:
+            # MULTIPLE: upload each segment separately.
             results = []
             for label, seg_bytes in segments:
                 split_key = _build_split_key(object_key, label)
-                try:
-                    s3.put_object(
-                        Bucket=bucket,
-                        Key=split_key,
-                        Body=io.BytesIO(seg_bytes),
-                        ContentType="application/pdf",
-                    )
-                except Exception as exc:
-                    log.error("[ERROR] R2 put failed for segment %r: %s", label, exc)
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to store split segment '{label}' in R2",
-                    )
-
-                try:
-                    presigned = generate_presigned_url(
-                        account_id=_env("R2_ACCOUNT_ID"),
-                        access_key_id=_env("R2_ACCESS_KEY_ID"),
-                        secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
-                        bucket_name=bucket,
-                        object_key=split_key,
-                        expires_in=expiry_minutes * 60,
-                    )
-                except Exception as exc:
-                    log.error("[ERROR] Presigned URL generation failed for segment %r: %s", label, exc)
-                    raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
-
+                presigned = _upload_and_sign(split_key, seg_bytes)
                 results.append({"segment": label, "url": presigned, "splitKey": split_key})
 
-            return {
-                "success": True,
-                "outputOption": "MULTIPLE",
-                "results": results,
-            }
+        return {
+            "success": True,
+            "outputOption": output_option,
+            "results": results,
+        }
     finally:
         _HEAVY_TASK_SEMAPHORE.release()
         log.info("[QUEUE] Released heavy task slot for /split")

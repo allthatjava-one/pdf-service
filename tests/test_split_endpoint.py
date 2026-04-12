@@ -194,14 +194,19 @@ def test_split_one_multiple_segments(monkeypatch):
 
     assert resp.status_code == 200
     data = resp.json()
+    # ONE: combined into single PDF, returned as single-entry results list
     assert data["success"] is True
     assert data["outputOption"] == "ONE"
-    assert "presignedUrl" in data
-    assert "splitKey" in data
-    combined_key = data["splitKey"]
+    results = data["results"]
+    assert len(results) == 1
+    item = results[0]
+    assert item["segment"] == "combined"
+    assert "url" in item
+    combined_key = item["splitKey"]
     assert combined_key.endswith("-split-combined.pdf")
     assert combined_key in fake.stored
-    # Combined PDF should have all 3 pages
+    assert fake.stored[combined_key]["ContentType"] == "application/pdf"
+    # Combined PDF should contain all 3 pages
     assert _page_count(fake.stored[combined_key]["Body"]) == 3
 
 
@@ -224,10 +229,15 @@ def test_split_one_single_segment(monkeypatch):
 
     assert resp.status_code == 200
     data = resp.json()
+    # ONE with a single segment: still wrapped in results list
     assert data["outputOption"] == "ONE"
-    assert "presignedUrl" in data
-    combined_key = data["splitKey"]
-    assert _page_count(fake.stored[combined_key]["Body"]) == 2
+    results = data["results"]
+    assert len(results) == 1
+    item = results[0]
+    assert item["segment"] == "combined"
+    assert "url" in item
+    key = item["splitKey"]
+    assert _page_count(fake.stored[key]["Body"]) == 2
 
 
 # ---------------------------------------------------------------------------
