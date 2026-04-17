@@ -48,10 +48,11 @@ from fastapi.responses import JSONResponse
 
 from src.cleanup import delete_old_compressed_files
 from src.pdf_compressor import compress_pdf
-from src.pdf_merger import merge_pdfs
-from src.pdf_splitter import split_pdf
+# from src.pdf_merger import merge_pdfs  # disabled — kept for reference
+# from src.pdf_splitter import split_pdf  # disabled — kept for reference
 from src.presigned_url import generate_presigned_url
 from src.pdf_converter import convert_pdf, DEFAULT_DPI as _CONVERTER_DEFAULT_DPI
+from src.background_remover import remove_background_image
 import asyncio
 
 # limit concurrent heavy tasks (compress/merge/convert) to avoid memory spikes
@@ -113,28 +114,39 @@ def _build_compressed_key(original_key: str) -> str:
     return f"{original_key}-compressed"
 
 
-def _build_merged_key(original_key: str) -> str:
+def _build_bg_key(original_key: str, suffix: str) -> str:
     if "." in original_key.split("/")[-1]:
-        name, _, ext = original_key.rpartition(".")
-        return f"{name}-merged.{ext}"
-    return f"{original_key}-merged"
+        name, _, _ = original_key.rpartition(".")
+        return f"{name}-{suffix}.png"
+    return f"{original_key}-{suffix}.png"
 
 
-def _build_split_key(original_key: str, segment: str) -> str:
-    if "." in original_key.split("/")[-1]:
-        name, _, ext = original_key.rpartition(".")
-        return f"{name}-split-{segment}.{ext}"
-    return f"{original_key}-split-{segment}"
+# _build_merged_key, _build_split_key, and _build_split_combined_key
+# are disabled (kept for reference). The PDF merger/splitter features
+# have been commented out but retained in the repository.
+
+# def _build_merged_key(original_key: str) -> str:
+#     if "." in original_key.split("/")[-1]:
+#         name, _, ext = original_key.rpartition(".")
+#         return f"{name}-merged.{ext}"
+#     return f"{original_key}-merged"
 
 
-def _build_split_combined_key(original_key: str) -> str:
-    if "." in original_key.split("/")[-1]:
-        name, _, ext = original_key.rpartition(".")
-        return f"{name}-split-combined.{ext}"
-    return f"{original_key}-split-combined"
+# def _build_split_key(original_key: str, segment: str) -> str:
+#     if "." in original_key.split("/")[-1]:
+#         name, _, ext = original_key.rpartition(".")
+#         return f"{name}-split-{segment}.{ext}"
+#     return f"{original_key}-split-{segment}"
 
 
-_SPLIT_OUTPUT_OPTIONS = {"ONE", "MULTIPLE"}
+# def _build_split_combined_key(original_key: str) -> str:
+#     if "." in original_key.split("/")[-1]:
+#         name, _, ext = original_key.rpartition(".")
+#         return f"{name}-split-combined.{ext}"
+#     return f"{original_key}-split-combined"
+
+
+# _SPLIT_OUTPUT_OPTIONS = {"ONE", "MULTIPLE"}  # disabled
 
 
 # ---------------------------------------------------------------------------
@@ -304,119 +316,122 @@ async def compress(request: Request):
     }
 
 
-@app.post("/merge")
-async def merge(request: Request):
-    body = await request.json()
-    object_keys = body.get("objectKeys") if isinstance(body, dict) else None
-    compress = body.get("compress") if isinstance(body, dict) else False
-    if not isinstance(object_keys, list) or len(object_keys) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing or invalid field: 'objectKeys' (must contain at least 2 items)",
-        )
+# Disabled /merge endpoint: PDF merging removed but original implementation
+# is retained below as a commented reference.
 
-    normalized_keys = []
-    for object_key in object_keys:
-        if not isinstance(object_key, str) or not object_key.strip():
-            raise HTTPException(status_code=400, detail="All 'objectKeys' entries must be non-empty strings")
-        normalized_keys.append(object_key.strip())
-
-    log.info("[INFO] /merge request for keys: %r, compress=%r", normalized_keys, compress)
-
-    s3 = _r2_client()
-    bucket = _env("R2_BUCKET_NAME")
-
-    # Serialize heavy work to avoid concurrent memory spikes
-    await _HEAVY_TASK_SEMAPHORE.acquire()
-    log.info("[QUEUE] Acquired heavy task slot for /merge")
-    try:
-        source_pdfs: list[bytes] = []
-        original_total_size = 0
-
-        for object_key in normalized_keys:
-            try:
-                response = s3.get_object(Bucket=bucket, Key=object_key)
-                pdf_bytes = response["Body"].read()
-            except s3.exceptions.NoSuchKey:
-                raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
-            except Exception as exc:
-                log.error("[ERROR] R2 fetch failed for %r: %s", object_key, exc)
-                raise HTTPException(status_code=500, detail="Failed to fetch objects from R2")
-
-            source_pdfs.append(pdf_bytes)
-            original_total_size += len(pdf_bytes)
-
-        try:
-            merged_bytes = merge_pdfs(source_pdfs)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=f"PDF merge failed: {exc}")
-        except Exception as exc:
-            log.error("[ERROR] Merge failed: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to merge PDF files")
-
-        del source_pdfs  # free source PDF bytes — no longer needed
-
-        merged_key = _build_merged_key(normalized_keys[0])
-        result_key = merged_key
-        merged_size = len(merged_bytes)
-        compressed_size = None
-
-        if compress:
-            try:
-                result_bytes = compress_pdf(merged_bytes)
-                del merged_bytes  # free uncompressed merged PDF
-                compressed_key = _build_compressed_key(merged_key)
-                result_key = compressed_key
-                compressed_size = len(result_bytes)
-                log.info("[INFO] Compressed merged PDF: %d -> %d bytes", merged_size, compressed_size)
-            except Exception as exc:
-                log.error("[ERROR] Compression after merge failed: %s", exc)
-                raise HTTPException(status_code=422, detail=f"Compression after merge failed: {exc}")
-        else:
-            result_bytes = merged_bytes
-
-        try:
-            s3.put_object(
-                Bucket=bucket,
-                Key=result_key,
-                Body=io.BytesIO(result_bytes),
-                ContentType="application/pdf",
-            )
-        except Exception as exc:
-            log.error("[ERROR] R2 put failed for merged/compressed file: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to store merged/compressed file in R2")
-    finally:
-        _HEAVY_TASK_SEMAPHORE.release()
-        log.info("[QUEUE] Released heavy task slot for /merge")
-
-    try:
-        expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
-        presigned = generate_presigned_url(
-            account_id=_env("R2_ACCOUNT_ID"),
-            access_key_id=_env("R2_ACCESS_KEY_ID"),
-            secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
-            bucket_name=bucket,
-            object_key=result_key,
-            expires_in=expiry_minutes * 60,
-        )
-    except Exception as exc:
-        log.error("[ERROR] Presigned URL generation failed for merged/compressed file: %s", exc)
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
-
-    response_data = {
-        "success": True,
-        "mergedKey": merged_key,
-        "presignedUrl": presigned,
-        "sourceCount": len(normalized_keys),
-        "originalTotalSize": original_total_size,
-        "mergedSize": merged_size,
-        "resultKey": result_key,
-    }
-    if compress:
-        response_data["compressedKey"] = result_key
-        response_data["compressedSize"] = compressed_size
-
-    return response_data
+# @app.post("/merge")
+# async def merge(request: Request):
+#     body = await request.json()
+#     object_keys = body.get("objectKeys") if isinstance(body, dict) else None
+#     compress = body.get("compress") if isinstance(body, dict) else False
+#     if not isinstance(object_keys, list) or len(object_keys) < 2:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Missing or invalid field: 'objectKeys' (must contain at least 2 items)",
+#         )
+#
+#     normalized_keys = []
+#     for object_key in object_keys:
+#         if not isinstance(object_key, str) or not object_key.strip():
+#             raise HTTPException(status_code=400, detail="All 'objectKeys' entries must be non-empty strings")
+#         normalized_keys.append(object_key.strip())
+#
+#     log.info("[INFO] /merge request for keys: %r, compress=%r", normalized_keys, compress)
+#
+#     s3 = _r2_client()
+#     bucket = _env("R2_BUCKET_NAME")
+#
+#     # Serialize heavy work to avoid concurrent memory spikes
+#     await _HEAVY_TASK_SEMAPHORE.acquire()
+#     log.info("[QUEUE] Acquired heavy task slot for /merge")
+#     try:
+#         source_pdfs: list[bytes] = []
+#         original_total_size = 0
+#
+#         for object_key in normalized_keys:
+#             try:
+#                 response = s3.get_object(Bucket=bucket, Key=object_key)
+#                 pdf_bytes = response["Body"].read()
+#             except s3.exceptions.NoSuchKey:
+#                 raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+#             except Exception as exc:
+#                 log.error("[ERROR] R2 fetch failed for %r: %s", object_key, exc)
+#                 raise HTTPException(status_code=500, detail="Failed to fetch objects from R2")
+#
+#             source_pdfs.append(pdf_bytes)
+#             original_total_size += len(pdf_bytes)
+#
+#         try:
+#             merged_bytes = merge_pdfs(source_pdfs)
+#         except ValueError as exc:
+#             raise HTTPException(status_code=422, detail=f"PDF merge failed: {exc}")
+#         except Exception as exc:
+#             log.error("[ERROR] Merge failed: %s", exc)
+#             raise HTTPException(status_code=500, detail="Failed to merge PDF files")
+#
+#         del source_pdfs  # free source PDF bytes — no longer needed
+#
+#         merged_key = _build_merged_key(normalized_keys[0])
+#         result_key = merged_key
+#         merged_size = len(merged_bytes)
+#         compressed_size = None
+#
+#         if compress:
+#             try:
+#                 result_bytes = compress_pdf(merged_bytes)
+#                 del merged_bytes  # free uncompressed merged PDF
+#                 compressed_key = _build_compressed_key(merged_key)
+#                 result_key = compressed_key
+#                 compressed_size = len(result_bytes)
+#                 log.info("[INFO] Compressed merged PDF: %d -> %d bytes", merged_size, compressed_size)
+#             except Exception as exc:
+#                 log.error("[ERROR] Compression after merge failed: %s", exc)
+#                 raise HTTPException(status_code=422, detail=f"Compression after merge failed: {exc}")
+#         else:
+#             result_bytes = merged_bytes
+#
+#         try:
+#             s3.put_object(
+#                 Bucket=bucket,
+#                 Key=result_key,
+#                 Body=io.BytesIO(result_bytes),
+#                 ContentType="application/pdf",
+#             )
+#         except Exception as exc:
+#             log.error("[ERROR] R2 put failed for merged/compressed file: %s", exc)
+#             raise HTTPException(status_code=500, detail="Failed to store merged/compressed file in R2")
+#     finally:
+#         _HEAVY_TASK_SEMAPHORE.release()
+#         log.info("[QUEUE] Released heavy task slot for /merge")
+#
+#     try:
+#         expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+#         presigned = generate_presigned_url(
+#             account_id=_env("R2_ACCOUNT_ID"),
+#             access_key_id=_env("R2_ACCESS_KEY_ID"),
+#             secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+#             bucket_name=bucket,
+#             object_key=result_key,
+#             expires_in=expiry_minutes * 60,
+#         )
+#     except Exception as exc:
+#         log.error("[ERROR] Presigned URL generation failed for merged/compressed file: %s", exc)
+#         raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+#
+#     response_data = {
+#         "success": True,
+#         "mergedKey": merged_key,
+#         "presignedUrl": presigned,
+#         "sourceCount": len(normalized_keys),
+#         "originalTotalSize": original_total_size,
+#         "mergedSize": merged_size,
+#         "resultKey": result_key,
+#     }
+#     if compress:
+#         response_data["compressedKey"] = result_key
+#         response_data["compressedSize"] = compressed_size
+#
+#     return response_data
 
 
 @app.post("/convert")
@@ -534,117 +549,197 @@ async def convert(request: Request):
     }
 
 
-@app.post("/split")
-async def split(request: Request):
+@app.post("/remove-background")
+async def remove_background(request: Request):
     body = await request.json()
     object_key: str | None = body.get("objectKey") if isinstance(body, dict) else None
-    split_option: str | None = body.get("splitOption") if isinstance(body, dict) else None
-    output_option = body.get("outputOption", "MULTIPLE") if isinstance(body, dict) else "MULTIPLE"
+    type_opt: str | None = body.get("type") if isinstance(body, dict) else None
+    quality: str | None = body.get("quality") if isinstance(body, dict) else None
+    blur_strength: str | None = body.get("blur-strength") if isinstance(body, dict) else None
+    threshold = body.get("threshold") if isinstance(body, dict) else None
 
     if not object_key or not isinstance(object_key, str) or not object_key.strip():
         raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
-    if not split_option or not isinstance(split_option, str) or not split_option.strip():
-        raise HTTPException(status_code=400, detail="Missing or invalid field: 'splitOption'")
-    if not isinstance(output_option, str):
-        output_option = "MULTIPLE"
-    output_option = output_option.strip().upper()
-    if output_option not in _SPLIT_OUTPUT_OPTIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid 'outputOption'. Allowed: {sorted(_SPLIT_OUTPUT_OPTIONS)}",
-        )
 
     object_key = object_key.strip()
-    split_option = split_option.strip()
-
-    log.info(
-        "[INFO] /split request for key=%r splitOption=%r outputOption=%r",
-        object_key, split_option, output_option,
-    )
+    type_opt = (type_opt or "remove").strip().lower()
+    if threshold is None:
+        thr = 80
+    else:
+        try:
+            thr = int(threshold)
+        except Exception:
+            raise HTTPException(status_code=400, detail="'threshold' must be an integer")
 
     s3 = _r2_client()
     bucket = _env("R2_BUCKET_NAME")
 
-    await _HEAVY_TASK_SEMAPHORE.acquire()
-    log.info("[QUEUE] Acquired heavy task slot for /split")
     try:
-        # --- Fetch source PDF from R2 ---
-        try:
-            response = s3.get_object(Bucket=bucket, Key=object_key)
-            original_bytes = response["Body"].read()
-        except s3.exceptions.NoSuchKey:
-            raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
-        except Exception as exc:
-            log.error("[ERROR] R2 fetch failed: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+        response = s3.get_object(Bucket=bucket, Key=object_key)
+        original_bytes = response["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+    except Exception as exc:
+        log.error("[ERROR] R2 fetch failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
 
-        # --- Split (CPU-bound; run in thread pool) ---
-        try:
-            segments = await asyncio.to_thread(split_pdf, original_bytes, split_option)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"PDF split failed: {exc}")
-        except Exception as exc:
-            log.error("[ERROR] Split failed: %s", exc)
-            raise HTTPException(status_code=500, detail="Failed to split PDF")
+    try:
+        processed = await asyncio.to_thread(
+            remove_background_image,
+            original_bytes,
+            type=type_opt,
+            quality=quality or "medium",
+            blur_strength=blur_strength,
+            threshold=thr,
+        )
+    except Exception as exc:
+        log.error("[ERROR] Background removal failed: %s", exc)
+        raise HTTPException(status_code=422, detail=f"Background processing failed: {exc}")
 
-        del original_bytes
+    if type_opt == "blur":
+        out_suffix = "bg-blurred"
+    else:
+        out_suffix = "bg-removed"
 
+    out_key = _build_bg_key(object_key, out_suffix)
+
+    try:
+        s3.put_object(Bucket=bucket, Key=out_key, Body=io.BytesIO(processed), ContentType="image/png")
+    except Exception as exc:
+        log.error("[ERROR] R2 put failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to store processed image in R2")
+
+    try:
         expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+        presigned = generate_presigned_url(
+            account_id=_env("R2_ACCOUNT_ID"),
+            access_key_id=_env("R2_ACCESS_KEY_ID"),
+            secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+            bucket_name=bucket,
+            object_key=out_key,
+            expires_in=expiry_minutes * 60,
+        )
+    except Exception as exc:
+        log.error("[ERROR] Presigned URL generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
 
-        def _upload_and_sign(key: str, data: bytes) -> str:
-            try:
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=key,
-                    Body=io.BytesIO(data),
-                    ContentType="application/pdf",
-                )
-            except Exception as exc:
-                log.error("[ERROR] R2 put failed for key %r: %s", key, exc)
-                raise HTTPException(status_code=500, detail=f"Failed to store '{key}' in R2")
-            try:
-                return generate_presigned_url(
-                    account_id=_env("R2_ACCOUNT_ID"),
-                    access_key_id=_env("R2_ACCESS_KEY_ID"),
-                    secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
-                    bucket_name=bucket,
-                    object_key=key,
-                    expires_in=expiry_minutes * 60,
-                )
-            except Exception as exc:
-                log.error("[ERROR] Presigned URL generation failed for key %r: %s", key, exc)
-                raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+    return {"success": True, "presignedUrl": presigned, "outputKey": out_key}
 
-        if output_option == "ONE":
-            # Merge all split segments into a single PDF, upload once, return one result entry.
-            if len(segments) == 1:
-                combined_bytes = segments[0][1]
-            else:
-                try:
-                    combined_bytes = merge_pdfs([seg_bytes for _, seg_bytes in segments])
-                except Exception as exc:
-                    log.error("[ERROR] Combining split segments failed: %s", exc)
-                    raise HTTPException(status_code=500, detail="Failed to combine split segments")
 
-            combined_key = _build_split_combined_key(object_key)
-            presigned = _upload_and_sign(combined_key, combined_bytes)
-            results = [{"segment": "combined", "url": presigned, "splitKey": combined_key}]
-        else:
-            # MULTIPLE: upload each segment separately.
-            results = []
-            for label, seg_bytes in segments:
-                split_key = _build_split_key(object_key, label)
-                presigned = _upload_and_sign(split_key, seg_bytes)
-                results.append({"segment": label, "url": presigned, "splitKey": split_key})
+# Disabled /split endpoint: PDF splitting removed but original implementation
+# retained below as a commented reference.
 
-        return {
-            "success": True,
-            "outputOption": output_option,
-            "results": results,
-        }
-    finally:
-        _HEAVY_TASK_SEMAPHORE.release()
-        log.info("[QUEUE] Released heavy task slot for /split")
+# @app.post("/split")
+# async def split(request: Request):
+#     body = await request.json()
+#     object_key: str | None = body.get("objectKey") if isinstance(body, dict) else None
+#     split_option: str | None = body.get("splitOption") if isinstance(body, dict) else None
+#     output_option = body.get("outputOption", "MULTIPLE") if isinstance(body, dict) else "MULTIPLE"
+#
+#     if not object_key or not isinstance(object_key, str) or not object_key.strip():
+#         raise HTTPException(status_code=400, detail="Missing or invalid field: 'objectKey'")
+#     if not split_option or not isinstance(split_option, str) or not split_option.strip():
+#         raise HTTPException(status_code=400, detail="Missing or invalid field: 'splitOption'")
+#     if not isinstance(output_option, str):
+#         output_option = "MULTIPLE"
+#     output_option = output_option.strip().upper()
+#     if output_option not in _SPLIT_OUTPUT_OPTIONS:
+#         raise HTTPException(
+#             status_code=400,
+#             detail=f"Invalid 'outputOption'. Allowed: {sorted(_SPLIT_OUTPUT_OPTIONS)}",
+#         )
+#
+#     object_key = object_key.strip()
+#     split_option = split_option.strip()
+#
+#     log.info(
+#         "[INFO] /split request for key=%r splitOption=%r outputOption=%r",
+#         object_key, split_option, output_option,
+#     )
+#
+#     s3 = _r2_client()
+#     bucket = _env("R2_BUCKET_NAME")
+#
+#     await _HEAVY_TASK_SEMAPHORE.acquire()
+#     log.info("[QUEUE] Acquired heavy task slot for /split")
+#     try:
+#         # --- Fetch source PDF from R2 ---
+#         try:
+#             response = s3.get_object(Bucket=bucket, Key=object_key)
+#             original_bytes = response["Body"].read()
+#         except s3.exceptions.NoSuchKey:
+#             raise HTTPException(status_code=404, detail=f"Object not found: {object_key}")
+#         except Exception as exc:
+#             log.error("[ERROR] R2 fetch failed: %s", exc)
+#             raise HTTPException(status_code=500, detail="Failed to fetch object from R2")
+#
+#         # --- Split (CPU-bound; run in thread pool) ---
+#         try:
+#             segments = await asyncio.to_thread(split_pdf, original_bytes, split_option)
+#         except ValueError as exc:
+#             raise HTTPException(status_code=400, detail=f"PDF split failed: {exc}")
+#         except Exception as exc:
+#             log.error("[ERROR] Split failed: %s", exc)
+#             raise HTTPException(status_code=500, detail="Failed to split PDF")
+#
+#         del original_bytes
+#
+#         expiry_minutes = int(_env("PRESIGNED_URL_EXPIRY", "60"))
+#
+#         def _upload_and_sign(key: str, data: bytes) -> str:
+#             try:
+#                 s3.put_object(
+#                     Bucket=bucket,
+#                     Key=key,
+#                     Body=io.BytesIO(data),
+#                     ContentType="application/pdf",
+#                 )
+#             except Exception as exc:
+#                 log.error("[ERROR] R2 put failed for key %r: %s", key, exc)
+#                 raise HTTPException(status_code=500, detail=f"Failed to store '{key}' in R2")
+#             try:
+#                 return generate_presigned_url(
+#                     account_id=_env("R2_ACCOUNT_ID"),
+#                     access_key_id=_env("R2_ACCESS_KEY_ID"),
+#                     secret_access_key=_env("R2_SECRET_ACCESS_KEY"),
+#                     bucket_name=bucket,
+#                     object_key=key,
+#                     expires_in=expiry_minutes * 60,
+#                 )
+#             except Exception as exc:
+#                 log.error("[ERROR] Presigned URL generation failed for key %r: %s", key, exc)
+#                 raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+#
+#         if output_option == "ONE":
+#             # Merge all split segments into a single PDF, upload once, return one result entry.
+#             if len(segments) == 1:
+#                 combined_bytes = segments[0][1]
+#             else:
+#                 try:
+#                     combined_bytes = merge_pdfs([seg_bytes for _, seg_bytes in segments])
+#                 except Exception as exc:
+#                     log.error("[ERROR] Combining split segments failed: %s", exc)
+#                     raise HTTPException(status_code=500, detail="Failed to combine split segments")
+#
+#             combined_key = _build_split_combined_key(object_key)
+#             presigned = _upload_and_sign(combined_key, combined_bytes)
+#             results = [{"segment": "combined", "url": presigned, "splitKey": combined_key}]
+#         else:
+#             # MULTIPLE: upload each segment separately.
+#             results = []
+#             for label, seg_bytes in segments:
+#                 split_key = _build_split_key(object_key, label)
+#                 presigned = _upload_and_sign(split_key, seg_bytes)
+#                 results.append({"segment": label, "url": presigned, "splitKey": split_key})
+#
+#         return {
+#             "success": True,
+#             "outputOption": output_option,
+#             "results": results,
+#         }
+#     finally:
+#         _HEAVY_TASK_SEMAPHORE.release()
+#         log.info("[QUEUE] Released heavy task slot for /split")
 
 
 @app.post("/admin/trigger-cleanup")

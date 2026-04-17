@@ -1,3 +1,11 @@
+"""
+PDF merger disabled.
+
+The original implementation is preserved below as a literal string for
+reference but is not executed.
+"""
+
+_ORIGINAL_IMPL = '''
 from __future__ import annotations
 
 import fitz  # PyMuPDF
@@ -31,3 +39,4 @@ def merge_pdfs(input_pdfs: list[bytes]) -> bytes:
         return merged_doc.tobytes(garbage=4, deflate=True, deflate_fonts=True, clean=True)
     finally:
         merged_doc.close()
+'''
