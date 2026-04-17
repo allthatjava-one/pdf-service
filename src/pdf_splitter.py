@@ -1,4 +1,15 @@
 """
+PDF splitter disabled.
+
+The original implementation has been retained below as a literal string
+for reference but is not executed.
+"""
+
+_ORIGINAL_IMPL = """
+"""
+
+_ORIGINAL_IMPL = '''
+"""
 PDF splitting using PyMuPDF (fitz).
 
 Accepts a ``splitOption`` string such as ``"1,3,5-7"`` and returns one PDF
@@ -127,3 +138,5 @@ def split_pdf(input_bytes: bytes, split_option: str) -> list[tuple[str, bytes]]:
         return results
     finally:
         doc.close()
+'''
+

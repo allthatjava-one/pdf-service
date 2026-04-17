@@ -1,7 +1,7 @@
 
 # Start app in local
 ```
-wrangler dev --remote --port 8787
+python -m uvicorn main:app --host 0.0.0.0 --port 8787
 ```
 
 # Deploy to Cloudflare Pages
@@ -16,10 +16,6 @@ Keep all variables as secret type
 > build command: leave empty
 > run command: uvicorn main:app --host 0.0.0.0 --port $PORT
 > Work directory: leave empty
-```
-# Run
-```
-python -m uvicorn main:app --host 0.0.0.0 --port 8787
 ```
 
 # Debug

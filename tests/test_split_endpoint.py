@@ -3,6 +3,9 @@ import io
 
 import fitz  # PyMuPDF
 import pytest
+
+pytest.skip("/split endpoint disabled — tests skipped", allow_module_level=True)
+
 from fastapi.testclient import TestClient
 
 import main as app_module

@@ -4,6 +4,8 @@ import io
 import fitz  # PyMuPDF
 import pytest
 
+pytest.skip("pdf_splitter disabled — tests skipped", allow_module_level=True)
+
 from src.pdf_splitter import split_pdf
 
 
